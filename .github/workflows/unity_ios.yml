@@ -1,0 +1,352 @@
+name: unity-build-and-ios-upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_patch:
+        description: 'Apply EasyLaunch patch'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  validateSecrets:
+    name: Validate secrets and variables
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Check required values
+        env:
+          # Unity
+          UNITY_LICENSE:            ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL:              ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD:           ${{ secrets.UNITY_PASSWORD }}
+          # App Store Connect
+          APPSTORE_KEY_ID:          ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_ISSUER_ID:       ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_P8:              ${{ secrets.APPSTORE_P8 }}
+          # Match
+          MATCH_PASSWORD:           ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL:            ${{ vars.MATCH_GIT_URL || secrets.MATCH_GIT_URL }}
+          GH_PAT:                   ${{ secrets.GH_PAT }}
+          # App
+          BUNDLE_IDENTIFIER:        ${{ vars.BUNDLE_IDENTIFIER || secrets.BUNDLE_IDENTIFIER }}
+          APPLE_TEAM_ID:            ${{ vars.APPLE_TEAM_ID || secrets.APPLE_TEAM_ID }}
+          APPLE_ID_DIGITS:          ${{ vars.APPLE_ID_DIGITS || secrets.APPLE_ID_DIGITS }}
+          MAJOR_VERSION:            ${{ vars.MAJOR_VERSION || secrets.MAJOR_VERSION }}
+          # EasyLaunch patch
+          EL_APPSFLYER_DEV_KEY:     ${{ secrets.EL_APPSFLYER_DEV_KEY }}
+          EL_ENDPOINT_URL:          ${{ vars.EL_ENDPOINT_URL }}
+        run: |
+          MISSING=()
+
+          check() {
+            local name="$1" value="$2"
+            if [[ -z "$value" ]]; then
+              MISSING+=("$name")
+              echo "  ✗  $name"
+            else
+              echo "  ✓  $name"
+            fi
+          }
+
+          check_file() {
+            local path="$1"
+            if [ -e "$path" ]; then
+              echo "  ✓  file: $path"
+            else
+              MISSING+=("file:$path")
+              echo "  ✗  file: $path"
+            fi
+          }
+
+          echo "::group::Unity"
+          if [[ -n "$UNITY_LICENSE" ]]; then
+            echo "  ✓  UNITY_LICENSE (опционально, задан)"
+          else
+            echo "  •  UNITY_LICENSE не задан — ок, будет активация через email/пароль"
+          fi
+          check "UNITY_EMAIL"               "$UNITY_EMAIL"
+          check "UNITY_PASSWORD"            "$UNITY_PASSWORD"
+          echo "::endgroup::"
+
+          echo "::group::App Store Connect"
+          check "APPSTORE_KEY_ID"           "$APPSTORE_KEY_ID"
+          check "APPSTORE_ISSUER_ID"        "$APPSTORE_ISSUER_ID"
+          check "APPSTORE_P8"               "$APPSTORE_P8"
+          echo "::endgroup::"
+
+          echo "::group::Match / Signing"
+          check "MATCH_PASSWORD"            "$MATCH_PASSWORD"
+          check "MATCH_GIT_URL"             "$MATCH_GIT_URL"
+          check "GH_PAT"                    "$GH_PAT"
+          check "APPLE_TEAM_ID"             "$APPLE_TEAM_ID"
+          echo "::endgroup::"
+
+          echo "::group::App"
+          check "BUNDLE_IDENTIFIER"         "$BUNDLE_IDENTIFIER"
+          check "APPLE_ID_DIGITS"           "$APPLE_ID_DIGITS"
+          check "MAJOR_VERSION"             "$MAJOR_VERSION"
+          echo "::endgroup::"
+
+          echo "::group::EasyLaunch patch"
+          check "EL_APPSFLYER_DEV_KEY"      "$EL_APPSFLYER_DEV_KEY"
+          check "EL_ENDPOINT_URL"           "$EL_ENDPOINT_URL"
+          echo "::endgroup::"
+
+          echo "::group::Required repository files"
+          check_file "GoogleService-Info.plist"
+          check_file "fastlane/Fastfile"
+          check_file "Gemfile"
+          check_file "EasyLaunch-Patch/patch.sh"
+          check_file "ProjectSettings/ProjectSettings.asset"
+          echo "::endgroup::"
+
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "## ❌ Missing secrets / variables" >> "$GITHUB_STEP_SUMMARY"
+            for v in "${MISSING[@]}"; do echo "- \`$v\`" >> "$GITHUB_STEP_SUMMARY"; done
+            echo ""
+            echo "❌ Missing required secrets/variables:"
+            for v in "${MISSING[@]}"; do echo "   • $v"; done
+            exit 1
+          fi
+
+          echo "## ✅ All secrets and variables present" >> "$GITHUB_STEP_SUMMARY"
+          echo "All ${#} required values validated successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "✅ All required secrets and variables are present."
+
+
+  buildForAllSupportedPlatforms:
+    name: Build for ${{ matrix.targetPlatform }} on ${{ matrix.unity-version }}
+    needs: validateSecrets
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        unity-version:
+          - ${{ vars.UNITY_VERSION || '6000.3.11f1' }}
+        os:
+          - ubuntu-latest
+        targetPlatform:
+          - iOS
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Patch Unity bundle identifier
+        env:
+          BUNDLE_IDENTIFIER: ${{ vars.BUNDLE_IDENTIFIER || secrets.BUNDLE_IDENTIFIER }}
+        run: |
+          echo "::group::Bundle identifier"
+          sed -i "0,/    iPhone: .*/s/    iPhone: .*/    iPhone: ${BUNDLE_IDENTIFIER}/" ProjectSettings/ProjectSettings.asset
+          echo "Set to: ${BUNDLE_IDENTIFIER}"
+          grep "iPhone:" ProjectSettings/ProjectSettings.asset
+          echo "::endgroup::"
+
+          echo "::group::Target device"
+          sed -i "s/  targetDevice: .*/  targetDevice: 0/" ProjectSettings/ProjectSettings.asset
+          echo "Set to: iPhone only (0)"
+          grep "targetDevice:" ProjectSettings/ProjectSettings.asset
+          echo "::endgroup::"
+
+          echo "::group::Disable Unity Splash Screen"
+          sed -i "s/  m_ShowUnitySplashScreen: .*/  m_ShowUnitySplashScreen: 0/" ProjectSettings/ProjectSettings.asset
+          echo "Set to: m_ShowUnitySplashScreen = 0"
+          grep "m_ShowUnitySplashScreen:" ProjectSettings/ProjectSettings.asset
+          echo "::endgroup::"
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - name: Cache Library folder
+        uses: actions/cache@v3
+        with:
+          path: Library
+          key: Library-${{ matrix.targetPlatform }}
+          restore-keys: Library-
+
+      - name: Debug Unity license source
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+        run: |
+          echo "::group::Unity license debug"
+          echo "UNITY_LICENSE length: ${#UNITY_LICENSE}"
+          if [ -n "$UNITY_LICENSE" ]; then
+            echo "-> UNITY_LICENSE задан: game-ci возьмёт готовый .ulf, UNITY_EMAIL/UNITY_PASSWORD будут ПРОИГНОРИРОВАНЫ"
+            echo "UNITY_LICENSE sha256: $(printf '%s' "$UNITY_LICENSE" | sha256sum)"
+          else
+            echo "-> UNITY_LICENSE пуст: будет живая активация Personal-лицензии через UNITY_EMAIL/UNITY_PASSWORD"
+          fi
+          echo "UNITY_EMAIL domain: ${UNITY_EMAIL#*@}"
+          echo "UNITY_EMAIL length: ${#UNITY_EMAIL}"
+          echo "UNITY_EMAIL sha256: $(printf '%s' "$UNITY_EMAIL" | sha256sum)"
+          echo "::endgroup::"
+
+      - name: Cache Unity packages
+        uses: game-ci/unity-builder@v4.8.1
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: ${{ matrix.targetPlatform }}
+          allowDirtyBuild: true
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-${{ matrix.targetPlatform }}
+          path: build/${{ matrix.targetPlatform }}
+
+
+  xcodeBuildAndUpload:
+    name: Xcode Build and Upload to TestFlight
+    needs: buildForAllSupportedPlatforms
+    runs-on: macos-latest
+    env:
+      IOS_BUILD_PATH: ${{ format('{0}/build/iOS', github.workspace) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download iOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Build-iOS
+          path: build/iOS
+
+      - name: Copy GoogleService-Info.plist into Xcode project root
+        run: |
+          echo "::group::Copy GoogleService-Info.plist"
+          if [ -f "$GITHUB_WORKSPACE/GoogleService-Info.plist" ]; then
+            mkdir -p "$IOS_BUILD_PATH/iOS"
+            cp "$GITHUB_WORKSPACE/GoogleService-Info.plist" "$IOS_BUILD_PATH/iOS/GoogleService-Info.plist"
+            echo "Copied GoogleService-Info.plist to $IOS_BUILD_PATH/iOS/"
+          else
+            echo "GoogleService-Info.plist not found in repo root ($GITHUB_WORKSPACE)." >&2
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Apply EasyLaunch patch
+        if: github.event.inputs.apply_patch == 'true'
+        env:
+          EL_APPSFLYER_DEV_KEY:      ${{ secrets.EL_APPSFLYER_DEV_KEY }}
+          EL_APPLE_APP_ID:           ${{ vars.APPLE_ID_DIGITS || secrets.APPLE_ID_DIGITS }}
+          EL_ENDPOINT_URL:           ${{ vars.EL_ENDPOINT_URL }}
+          EL_LOADING_TITLE:          ${{ vars.EL_LOADING_TITLE || 'Loading' }}
+        run: |
+          echo "::group::Generate easylaunch.config"
+          printf 'EL_APPSFLYER_DEV_KEY="%s"\n'      "$EL_APPSFLYER_DEV_KEY"      >  EasyLaunch-Patch/easylaunch.config
+          printf 'EL_APPLE_APP_ID="%s"\n'           "$EL_APPLE_APP_ID"           >> EasyLaunch-Patch/easylaunch.config
+          printf 'EL_ENDPOINT_URL="%s"\n'           "$EL_ENDPOINT_URL"           >> EasyLaunch-Patch/easylaunch.config
+          printf 'EL_LOADING_TITLE="%s"\n'          "$EL_LOADING_TITLE"          >> EasyLaunch-Patch/easylaunch.config
+          echo "Config written."
+          echo "::endgroup::"
+
+          echo "::group::Install xcodeproj gem"
+          gem list xcodeproj | grep -q xcodeproj || gem install xcodeproj --no-document
+          echo "::endgroup::"
+
+          echo "::group::Run patch.sh"
+          chmod +x EasyLaunch-Patch/patch.sh
+          EasyLaunch-Patch/patch.sh "$IOS_BUILD_PATH/iOS"
+          echo "::endgroup::"
+
+      - name: Setup xcode versioning system
+        run: |
+          ruby <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('build/iOS/iOS/Unity-iPhone.xcodeproj')
+          project.targets.each do |target|
+            target.build_configurations.each do |config|
+              config.build_settings['VERSIONING_SYSTEM'] = 'apple-generic'
+              config.build_settings['CURRENT_PROJECT_VERSION'] = ENV['LAST_UPLOADED_BUILD_NUMBER'] || '0'
+              puts "#{target.name} - #{config.build_settings['VERSIONING_SYSTEM']}"
+            end
+          end
+
+          # patch_pbxproj.py runs twice (pre- and post-SPM-resolve) and uses
+          # deterministic UUIDs, so the same PBXBuildFile UUID can end up
+          # referenced in two different ResourcesBuildPhases (Unity-iPhone and
+          # NotificationService). xcodeproj's parent-consistency check raises on
+          # save in that case. Fix: give every extra occurrence its own object.
+          uuid_phases = Hash.new { |h, k| h[k] = [] }
+          project.targets.each do |target|
+            target.build_phases.each do |phase|
+              phase.files.each { |bf| uuid_phases[bf.uuid] << [phase, bf] }
+            end
+          end
+          uuid_phases.each do |_uuid, entries|
+            next if entries.size < 2
+            entries[1..].each do |phase, old_bf|
+              new_bf = project.new(Xcodeproj::Project::Object::PBXBuildFile)
+              new_bf.file_ref = old_bf.file_ref
+              new_bf.settings = old_bf.settings.dup if old_bf.settings
+              idx = phase.files.index(old_bf)
+              phase.files.delete(old_bf)
+              phase.files.insert(idx, new_bf)
+              puts "  fixed duplicate build-file '#{old_bf.file_ref&.path}' in #{phase.class} of #{phase.target&.name rescue '?'}"
+            end
+          end
+
+          project.save
+          RUBY
+
+      - name: Install agvtool
+        run: |
+          echo "::group::Select Xcode and accept license"
+          sudo xcode-select --switch /Applications/Xcode.app
+          sudo xcodebuild -license accept
+          echo "::endgroup::"
+          echo "::group::Verify agvtool"
+          which agvtool || echo 'agvtool not found, but should be available with Xcode.'
+          agvtool help || echo 'agvtool installed.'
+          echo "::endgroup::"
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ vars.XCODE_VERSION || '16.3.0' }}
+        
+      - name: Set up ruby env
+        uses: ruby/setup-ruby@v1.269.0
+        with:
+          ruby-version: 3.3
+          bundler-cache: true
+
+      - name: Generate MATCH_GIT_BASIC_AUTHORIZATION
+        run: |
+          echo -n "NikDyr:${GH_PAT}" | base64 > base64.txt
+          echo "MATCH_GIT_BASIC_AUTHORIZATION=$(cat base64.txt)" >> $GITHUB_ENV
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          
+      - name: Build & upload iOS binary
+        run: bundle exec fastlane ios build_upload_testflight
+        env:
+          ASC_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          ASC_KEY: ${{ secrets.APPSTORE_P8 }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ env.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID || secrets.APPLE_TEAM_ID }}
+          BUNDLE_IDENTIFIER: ${{ vars.BUNDLE_IDENTIFIER || secrets.BUNDLE_IDENTIFIER }}
+          MATCH_GIT_URL: ${{ vars.MATCH_GIT_URL || secrets.MATCH_GIT_URL }}
+          APPLE_ID_DIGITS: ${{ vars.APPLE_ID_DIGITS || secrets.APPLE_ID_DIGITS }}
+          XC_TARGET_NAME: "Unity-iPhone"
+          IOS_BUILD_PATH: ${{ format('{0}/build/iOS', github.workspace) }}
+          LAST_UPLOADED_BUILD_NUMBER: ${{ vars.LAST_UPLOADED_BUILD_NUMBER || secrets.LAST_UPLOADED_BUILD_NUMBER }}
+          MAJOR_VERSION: ${{ vars.MAJOR_VERSION || secrets.MAJOR_VERSION }}

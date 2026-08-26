@@ -1,0 +1,21 @@
+# EasyLaunch конфигурация
+# Скопируйте этот файл: cp easylaunch.config.example easylaunch.config
+# Затем заполните значения ниже.
+#
+# Файл автоматически загружается patch.sh через `source`.
+
+# ── AppsFlyer ────────────────────────────────────────────────────────────────
+# Dev Key из dashboard.appsflyer.com → App Settings
+EL_APPSFLYER_DEV_KEY="YOUR_APPSFLYER_DEV_KEY"
+
+# Числовой Apple App Store ID (только цифры, без "id")
+EL_APPLE_APP_ID="000000000"
+
+# ── Сервер ───────────────────────────────────────────────────────────────────
+# Базовый URL вашего сервера без завершающего слэша
+# Эндпоинт запроса: EL_ENDPOINT_URL/api/init
+EL_ENDPOINT_URL="https://your-server.com"
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+# Заголовок на экране загрузки
+EL_LOADING_TITLE="Loading"
