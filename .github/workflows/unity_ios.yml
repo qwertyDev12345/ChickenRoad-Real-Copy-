@@ -170,14 +170,6 @@ jobs:
           key: Library-${{ matrix.targetPlatform }}
           restore-keys: Library-
       
-      - name: Install official Unity CLI
-        shell: bash
-        env:
-          UNITY_CLI_CHANNEL: beta
-        run: |
-          curl -fsSL https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
       - name: Set up Node for Personal license activation
         uses: actions/setup-node@v4
         with:
@@ -194,6 +186,22 @@ jobs:
           unity-cli hub-version
           unity-cli license-version
 
+      - name: Install Unity Editor with iOS support
+        shell: bash
+        run: |
+          unity-cli setup-unity \
+            --unity-project . \
+            --unity-version "${{ matrix.unity-version }}" \
+            --build-targets iOS \
+            --modules ios \
+            --json
+
+      - name: Verify Unity Editor installation
+        shell: bash
+        run: |
+          test -n "$UNITY_EDITOR_PATH"
+          echo "Unity Editor: $UNITY_EDITOR_PATH"
+
       - name: Activate Unity Personal
         shell: bash
         env:
@@ -206,27 +214,18 @@ jobs:
             --email "$UNITY_EMAIL" \
             --password "$UNITY_PASSWORD"
 
-      - name: Install Unity Editor with iOS support
-        shell: bash
-        run: |
-          unity install "${{ matrix.unity-version }}" \
-            --module ios \
-            --yes \
-            --accept-eula \
-            --non-interactive
-
       - name: Build Unity iOS project
         shell: bash
         env:
           IOS_UNITY_OUTPUT_PATH: build/iOS/iOS
         run: |
-          unity build . \
-            --editor-version "${{ matrix.unity-version }}" \
-            --target iOS \
-            --execute-method CiBuild.BuildIOS \
-            --output-path "$IOS_UNITY_OUTPUT_PATH" \
-            --allow-dirty-build \
-            --non-interactive
+          unity-cli run \
+            --unity-project . \
+            -quit \
+            -batchmode \
+            -nographics \
+            -buildTarget iOS \
+            -executeMethod CiBuild.BuildIOS
 
       - name: Return Unity license
         if: always()
