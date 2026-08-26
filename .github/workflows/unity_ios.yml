@@ -187,6 +187,13 @@ jobs:
         shell: bash
         run: npm install --global @rage-against-the-pixel/unity-cli
 
+      - name: Install Unity Hub and Licensing Client
+        shell: bash
+        run: |
+          unity-cli hub-install --hub-version 3.12.0
+          unity-cli hub-version
+          unity-cli license-version
+
       - name: Activate Unity Personal
         shell: bash
         env:
