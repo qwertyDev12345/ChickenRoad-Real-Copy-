@@ -255,6 +255,11 @@ jobs:
           name: Build-iOS
           path: build/iOS
 
+      - name: Restore executable permissions in Unity Xcode project
+        run: |
+          find "$IOS_BUILD_PATH" -type f -name '*.sh' -exec chmod +x {} \;
+          find "$IOS_BUILD_PATH" -type f -name '*.sh' -print
+
       - name: Copy GoogleService-Info.plist into Xcode project root
         run: |
           echo "::group::Copy GoogleService-Info.plist"
@@ -378,3 +383,11 @@ jobs:
           IOS_BUILD_PATH: ${{ format('{0}/build/iOS', github.workspace) }}
           LAST_UPLOADED_BUILD_NUMBER: ${{ vars.LAST_UPLOADED_BUILD_NUMBER || secrets.LAST_UPLOADED_BUILD_NUMBER }}
           MAJOR_VERSION: ${{ vars.MAJOR_VERSION || secrets.MAJOR_VERSION }}
+
+      - name: Upload complete Xcode build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-gym-logs
+          path: /Users/runner/Library/Logs/gym/*.log
+          if-no-files-found: warn
