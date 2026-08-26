@@ -25,8 +25,8 @@ jobs:
       - name: Check required values
         env:
           # Unity
-          UNITY_SERVICE_ACCOUNT_ID:     ${{ secrets.UNITY_SERVICE_ACCOUNT_ID }}
-          UNITY_SERVICE_ACCOUNT_SECRET: ${{ secrets.UNITY_SERVICE_ACCOUNT_SECRET }}
+          UNITY_EMAIL:              ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD:           ${{ secrets.UNITY_PASSWORD }}
           # App Store Connect
           APPSTORE_KEY_ID:          ${{ secrets.APPSTORE_KEY_ID }}
           APPSTORE_ISSUER_ID:       ${{ secrets.APPSTORE_ISSUER_ID }}
@@ -67,8 +67,8 @@ jobs:
           }
 
           echo "::group::Unity"
-          check "UNITY_SERVICE_ACCOUNT_ID"     "$UNITY_SERVICE_ACCOUNT_ID"
-          check "UNITY_SERVICE_ACCOUNT_SECRET" "$UNITY_SERVICE_ACCOUNT_SECRET"
+          check "UNITY_EMAIL"               "$UNITY_EMAIL"
+          check "UNITY_PASSWORD"            "$UNITY_PASSWORD"
           echo "::endgroup::"
 
           echo "::group::App Store Connect"
@@ -178,23 +178,26 @@ jobs:
           curl -fsSL https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Authenticate and activate Unity Personal
+      - name: Set up Node for Personal license activation
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Personal license activation CLI
+        shell: bash
+        run: npm install --global @rage-against-the-pixel/unity-cli
+
+      - name: Activate Unity Personal
         shell: bash
         env:
-          UNITY_SERVICE_ACCOUNT_ID: ${{ secrets.UNITY_SERVICE_ACCOUNT_ID }}
-          UNITY_SERVICE_ACCOUNT_SECRET: ${{ secrets.UNITY_SERVICE_ACCOUNT_SECRET }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         run: |
-          printf '%s' "$UNITY_SERVICE_ACCOUNT_SECRET" | \
-            unity auth login \
-              --client-id "$UNITY_SERVICE_ACCOUNT_ID" \
-              --secret-from-stdin \
-              --no-store \
-              --non-interactive
-          unity license activate \
-            --personal \
-            --accept-eula \
-            --non-interactive
-          unity license status --format json
+          unity-cli license-context
+          unity-cli activate-license \
+            --license personal \
+            --email "$UNITY_EMAIL" \
+            --password "$UNITY_PASSWORD"
 
       - name: Install Unity Editor with iOS support
         shell: bash
@@ -221,7 +224,7 @@ jobs:
       - name: Return Unity license
         if: always()
         shell: bash
-        run: unity license return --yes --non-interactive || true
+        run: unity-cli return-license --license personal || true
       
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
