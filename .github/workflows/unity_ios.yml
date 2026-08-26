@@ -68,11 +68,7 @@ jobs:
           }
 
           echo "::group::Unity"
-          if [[ -n "$UNITY_LICENSE" ]]; then
-            echo "  ✓  UNITY_LICENSE (опционально, задан)"
-          else
-            echo "  •  UNITY_LICENSE не задан — ок, будет активация через email/пароль"
-          fi
+          check "UNITY_LICENSE"             "$UNITY_LICENSE"
           check "UNITY_EMAIL"               "$UNITY_EMAIL"
           check "UNITY_PASSWORD"            "$UNITY_PASSWORD"
           echo "::endgroup::"
@@ -175,25 +171,7 @@ jobs:
           path: Library
           key: Library-${{ matrix.targetPlatform }}
           restore-keys: Library-
-
-      - name: Debug Unity license source
-        env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-        run: |
-          echo "::group::Unity license debug"
-          echo "UNITY_LICENSE length: ${#UNITY_LICENSE}"
-          if [ -n "$UNITY_LICENSE" ]; then
-            echo "-> UNITY_LICENSE задан: game-ci возьмёт готовый .ulf, UNITY_EMAIL/UNITY_PASSWORD будут ПРОИГНОРИРОВАНЫ"
-            echo "UNITY_LICENSE sha256: $(printf '%s' "$UNITY_LICENSE" | sha256sum)"
-          else
-            echo "-> UNITY_LICENSE пуст: будет живая активация Personal-лицензии через UNITY_EMAIL/UNITY_PASSWORD"
-          fi
-          echo "UNITY_EMAIL domain: ${UNITY_EMAIL#*@}"
-          echo "UNITY_EMAIL length: ${#UNITY_EMAIL}"
-          echo "UNITY_EMAIL sha256: $(printf '%s' "$UNITY_EMAIL" | sha256sum)"
-          echo "::endgroup::"
-
+      
       - name: Cache Unity packages
         uses: game-ci/unity-builder@v4.8.1
         env:
