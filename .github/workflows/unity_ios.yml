@@ -258,7 +258,17 @@ jobs:
       - name: Restore executable permissions in Unity Xcode project
         run: |
           find "$IOS_BUILD_PATH" -type f -name '*.sh' -exec chmod +x {} \;
-          find "$IOS_BUILD_PATH" -type f -name '*.sh' -print
+          find "$IOS_BUILD_PATH" -type f -name 'usymtool*' -exec chmod +x {} \;
+
+          USYMTOOL="$IOS_BUILD_PATH/iOS/usymtoolarm64"
+          if [ ! -x "$USYMTOOL" ]; then
+            echo "Unity symbol tool is missing or not executable: $USYMTOOL" >&2
+            ls -la "$IOS_BUILD_PATH/iOS" >&2
+            exit 1
+          fi
+
+          echo "Restored executable permissions:"
+          find "$IOS_BUILD_PATH" -type f \( -name '*.sh' -o -name 'usymtool*' \) -print
 
       - name: Copy GoogleService-Info.plist into Xcode project root
         run: |
