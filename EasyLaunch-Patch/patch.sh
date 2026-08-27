@@ -99,6 +99,7 @@ EL_APPSFLYER_DEV_KEY="YOUR_APPSFLYER_DEV_KEY"
 EL_APPLE_APP_ID="YOUR_APPLE_APP_ID"
 EL_ENDPOINT_URL="https://your-server.com"
 EL_LOADING_TITLE="Loading"
+EL_UNITY_ORIENTATION="landscape"
 
 if [[ -f "$CONFIG_FILE" ]]; then
     info "Загрузка конфигурации из easylaunch.config …"
@@ -108,6 +109,15 @@ else
     warn "easylaunch.config не найден — используются placeholder-значения."
     warn "Скопируйте easylaunch.config.example → easylaunch.config и заполните ключи."
 fi
+
+EL_UNITY_ORIENTATION="$(printf '%s' "$EL_UNITY_ORIENTATION" | tr '[:upper:]' '[:lower:]')"
+case "$EL_UNITY_ORIENTATION" in
+    landscape|portrait)
+        ;;
+    *)
+        error "EL_UNITY_ORIENTATION должен быть landscape или portrait (получено: ${EL_UNITY_ORIENTATION})"
+        ;;
+esac
 
 # =============================================================================
 # ШАГ 1 — Копирование исходников
@@ -166,6 +176,7 @@ fi
     -e "s|#define EL_APPLE_APP_ID.*|#define EL_APPLE_APP_ID             @\"${EL_APPLE_APP_ID}\"|" \
     -e "s|#define EL_ENDPOINT_URL.*|#define EL_ENDPOINT_URL             @\"${EL_ENDPOINT_URL}\"|" \
     -e "s|#define EL_LOADING_TITLE.*|#define EL_LOADING_TITLE            @\"${EL_LOADING_TITLE}\"|" \
+    -e "s|#define EL_UNITY_ORIENTATION.*|#define EL_UNITY_ORIENTATION        @\"${EL_UNITY_ORIENTATION}\"|" \
     "$DEST_CONFIG"
 
 success "EasyLaunchConfig.h обновлён."

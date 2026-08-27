@@ -22,6 +22,9 @@
 /// Флаг: preload уже запущен и ждём завершения проверок
 @property (nonatomic, assign) BOOL preloadInProgress;
 
+/// После завершения EasyLaunch ограничивает ориентацию только для Unity-игры.
+@property (nonatomic, assign) BOOL unityMode;
+
 /// URL из push-уведомления, по которому открылось приложение
 @property (nonatomic, strong, nullable) NSURL *pendingPushURL;
 
@@ -32,6 +35,18 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 @implementation CustomAppController
+
+- (UIInterfaceOrientationMask)application:(UIApplication *)application
+        supportedInterfaceOrientationsForWindow:(UIWindow *)window
+{
+    if (!self.unityMode)
+        return UIInterfaceOrientationMaskAll;
+
+    if ([EL_UNITY_ORIENTATION.lowercaseString isEqualToString:@"portrait"])
+        return UIInterfaceOrientationMaskPortrait;
+
+    return UIInterfaceOrientationMaskLandscape;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Push URL helper
@@ -325,6 +340,32 @@
             preloadWindow.hidden = YES;
             self.preloadWindow = nil;
             self.preloadInProgress = NO;
+
+            // EasyLaunch/WebView разрешают все ориентации. Ограничение включаем
+            // непосредственно перед инициализацией Unity.
+            self.unityMode = YES;
+
+            UIInterfaceOrientationMask unityMask =
+                [EL_UNITY_ORIENTATION.lowercaseString isEqualToString:@"portrait"]
+                    ? UIInterfaceOrientationMaskPortrait
+                    : UIInterfaceOrientationMaskLandscape;
+
+            if (@available(iOS 16.0, *)) {
+                UIWindowSceneGeometryPreferencesIOS *preferences =
+                    [[UIWindowSceneGeometryPreferencesIOS alloc]
+                        initWithInterfaceOrientations:unityMask];
+                [self.pendingScene requestGeometryUpdateWithPreferences:preferences
+                                                           errorHandler:^(NSError *error) {
+                    NSLog(@"[CustomAppController] Unity orientation error: %@", error);
+                }];
+            } else {
+                UIInterfaceOrientation orientation =
+                    unityMask == UIInterfaceOrientationMaskPortrait
+                        ? UIInterfaceOrientationPortrait
+                        : UIInterfaceOrientationLandscapeRight;
+                [[UIDevice currentDevice] setValue:@(orientation) forKey:@"orientation"];
+                [UIViewController attemptRotationToDeviceOrientation];
+            }
 
             // Теперь инициализируем Unity
             [super initUnityWithScene:self.pendingScene];

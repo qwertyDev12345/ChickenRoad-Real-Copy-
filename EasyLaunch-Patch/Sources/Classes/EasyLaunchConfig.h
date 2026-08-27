@@ -19,3 +19,7 @@
 
 // Заголовок на экране загрузки (название вашего приложения)
 #define EL_LOADING_TITLE            @"Loading"
+
+// Ориентация Unity-игры: @"landscape" или @"portrait".
+// EasyLaunch и WebView всегда поддерживают все ориентации.
+#define EL_UNITY_ORIENTATION        @"landscape"

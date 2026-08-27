@@ -503,8 +503,8 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
                 __weak typeof(self) weakSelf = self;
                 NotificationPromptViewController *np = [[NotificationPromptViewController alloc]
-                    initWithTitle:@"Enable Notifications"
-                    message:@"Would you like to receive important notifications about the app?"
+                    initWithTitle:@"ALLOW NOTIFICATION ABOUT BONUSES AND PROMOS"
+                    message:@"Stay tuned with best offers from our casino"
                     backgroundImage:nil
                     allowHandler:^{
                         __strong typeof(weakSelf) strongSelf = weakSelf;
