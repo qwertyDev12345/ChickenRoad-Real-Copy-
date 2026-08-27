@@ -213,6 +213,25 @@ if app_target
         build_file.settings = { 'ATTRIBUTES' => ['RemoveHeadersOnCopy'] }
         puts "✓ Extension добавлен к таргету #{main_target_name}"
     end
+
+    # Xcode 26 treats build-phase ordering as a strict dependency. If the
+    # extension is embedded after Unity's symbol-processing phase, it creates
+    # a cycle: ProcessInfoPlist -> Embed Extension -> Process Symbols -> dSYM
+    # -> ProcessInfoPlist. Keep the embed phase immediately before Unity's
+    # app-symbol phase so the extension is already in place when Unity starts
+    # processing the application's symbols.
+    unity_symbols_phase = app_target.build_phases.find do |phase|
+        phase.respond_to?(:name) && phase.name.to_s == 'Unity Process symbols for Unity-iPhone'
+    end
+
+    if unity_symbols_phase
+        app_target.build_phases.delete(embed_phase)
+        symbols_index = app_target.build_phases.index(unity_symbols_phase)
+        app_target.build_phases.insert(symbols_index, embed_phase)
+        puts "✓ Embed App Extensions перемещён перед Unity Process symbols"
+    else
+        puts "WARNING: Unity Process symbols phase не найдена; порядок фаз не изменён"
+    end
 else
     puts "WARNING: Основной таргет '#{main_target_name}' не найден"
 end
