@@ -28,6 +28,14 @@
 /// URL из push-уведомления, по которому открылось приложение
 @property (nonatomic, strong, nullable) NSURL *pendingPushURL;
 
+/// Monotonically increasing id of the last notification tap. It prevents an
+/// older deferred UI transition from opening after a newer notification tap.
+@property (nonatomic, assign) NSUInteger pushTapGeneration;
+
+- (void)pl_openURL:(NSURL *)url
+        generation:(NSUInteger)generation
+        retryCount:(NSUInteger)retryCount;
+
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +141,7 @@
     if (pushURL) {
         NSLog(@"[CustomAppController] Push tap URL: %@", pushURL);
         dispatch_async(dispatch_get_main_queue(), ^{
+            NSUInteger generation = ++self.pushTapGeneration;
             PreloadViewController *preloadVC =
                 (PreloadViewController *)self.preloadWindow.rootViewController;
 
@@ -150,7 +159,7 @@
 
             } else {
                 // Приложение уже работает (Unity/WebView открыт) — открываем/заменяем сразу.
-                [self pl_openURL:pushURL];
+                [self pl_openURL:pushURL generation:generation retryCount:0];
             }
         });
     }
@@ -193,12 +202,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)pl_openURL:(NSURL *)url
+        generation:(NSUInteger)generation
+        retryCount:(NSUInteger)retryCount
 {
     if (!url) return;
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self pl_openURL:url]; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self pl_openURL:url generation:generation retryCount:retryCount];
+        });
         return;
     }
+
+    // Only the most recently tapped notification is allowed to navigate.
+    if (generation != self.pushTapGeneration) return;
 
     // Ищем topmost presented view controller и показываем WebView поверх.
     // Перебираем все windows чтобы найти активный ключевой — используем keyWindow.
@@ -223,15 +239,21 @@
         top = top.presentedViewController;
     }
     if (!top || !top.view.window) {
-        // A notification tap can arrive before SceneDelegate has attached a window.
-        // Keep it for showPreloadScreenForScene: instead of presenting into an
-        // incomplete hierarchy (the first-push cold-start race).
-        self.pendingPushURL = url;
-        NSLog(@"[CustomAppController] UI not ready; deferred push URL");
+        // Runtime notification responses can arrive while the scene is being
+        // attached. Retry this exact response; never put it into the cold-start
+        // pending slot, where it could be consumed by a later notification.
+        if (retryCount < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [self pl_openURL:url generation:generation retryCount:retryCount + 1];
+            });
+        } else {
+            NSLog(@"[CustomAppController] Push UI did not become ready; URL not opened: %@", url);
+        }
         return;
     }
 
-    // Если уже открыт WebViewController с этим же URL — не открываем повторно
+    // Если WebViewController уже открыт — загружаем URL именно текущего tap.
     if ([top isKindOfClass:[WebViewController class]]) {
         // Reuse the controller. Dismissing and immediately recreating WKWebView
         // races its KVO teardown and was the source of first push-tap crashes.
@@ -241,8 +263,17 @@
     }
 
     if (top.isBeingPresented || top.isBeingDismissed || top.transitionCoordinator) {
-        self.pendingPushURL = url;
-        NSLog(@"[CustomAppController] UI transition in progress; deferred push URL");
+        id<UIViewControllerTransitionCoordinator> coordinator = top.transitionCoordinator;
+        if (coordinator) {
+            [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+                [self pl_openURL:url generation:generation retryCount:retryCount + 1];
+            }];
+        } else if (retryCount < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [self pl_openURL:url generation:generation retryCount:retryCount + 1];
+            });
+        }
         return;
     }
 
@@ -404,16 +435,6 @@
 {
     UNUserNotificationCenter.currentNotificationCenter.delegate = self;
     [super applicationDidBecomeActive:application];
-
-    // A push tap may have arrived while the scene/window was still inactive.
-    // Once the hierarchy is attached, consume that deferred URL exactly once.
-    if (self.pendingPushURL &&
-        self.engineLoadState >= kUnityEngineLoadStateCoreInitialized &&
-        !self.preloadInProgress) {
-        NSURL *url = self.pendingPushURL;
-        self.pendingPushURL = nil;
-        dispatch_async(dispatch_get_main_queue(), ^{ [self pl_openURL:url]; });
-    }
 }
 
 @end

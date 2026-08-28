@@ -19,6 +19,9 @@
 @property (nonatomic, assign) NSInteger maxProvisionalRetries;
 // Retry counter for didFailNavigation (non-TooManyRedirects) to prevent infinite loops
 @property (nonatomic, assign) NSInteger failRetryCount;
+@property (nonatomic, assign) NSUInteger navigationGeneration;
+@property (nonatomic, assign) NSUInteger fallbackGeneration;
+@property (nonatomic, strong) WKNavigation *activeNavigation;
 
 @end
 
@@ -29,6 +32,7 @@
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
         _url = url;
+        _navigationGeneration = 1;
         self.modalPresentationStyle = UIModalPresentationFullScreen;
     }
     return self;
@@ -39,20 +43,24 @@
     if (!url) return;
 
     void (^navigate)(void) = ^{
+        self.navigationGeneration++;
         self.url = url;
         if (!self.isViewLoaded || !self.webView) return;
 
+        [self.webView stopLoading];
         self.fallbackInProgress = NO;
         self.fallbackRedirectCount = 0;
         self.provisionalRetryCount = 0;
         self.failRetryCount = 0;
         [self.fallbackSession invalidateAndCancel];
         self.fallbackSession = nil;
+        self.fallbackData = nil;
+        [self.redirectRequests removeAllObjects];
 
         NSURLRequest *request = [NSURLRequest requestWithURL:url
                                                 cachePolicy:NSURLRequestReloadIgnoringCacheData
                                             timeoutInterval:WebViewConfigNavigationTimeout];
-        [self.webView loadRequest:request];
+        self.activeNavigation = [self.webView loadRequest:request];
     };
 
     if ([NSThread isMainThread]) navigate();
@@ -178,7 +186,7 @@
         NSURLRequest *req = [NSURLRequest requestWithURL:self.url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:WebViewConfigNavigationTimeout];
         self.fallbackInProgress = NO;
         self.fallbackRedirectCount = 0;
-        [self.webView loadRequest:req];
+        self.activeNavigation = [self.webView loadRequest:req];
     }
 }
 
@@ -215,6 +223,7 @@
 #pragma mark - WKNavigationDelegate
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error
 {
+    if (navigation && self.activeNavigation && navigation != self.activeNavigation) return;
     // Ignore cancellations (e.g. triggered by our own decidePolicyForNavigationAction)
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
         return;
@@ -240,13 +249,15 @@
             return;
         }
         self.failRetryCount++;
+        NSUInteger generation = self.navigationGeneration;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (generation != self.navigationGeneration) return;
             NSURL *target = webView.URL ?: self.url;
             if (target) {
                 NSURLRequest *req = [NSURLRequest requestWithURL:target
                                                     cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                 timeoutInterval:WebViewConfigNavigationTimeout];
-                [webView loadRequest:req];
+                self.activeNavigation = [webView loadRequest:req];
             }
         });
     }
@@ -288,7 +299,7 @@
     // by createWebViewWithConfiguration: — load in the current webView.
     if (!navigationAction.targetFrame) {
         if (requestURL) {
-            [webView loadRequest:navigationAction.request];
+            self.activeNavigation = [webView loadRequest:navigationAction.request];
         }
         decisionHandler(WKNavigationActionPolicyCancel);
         return;
@@ -313,7 +324,7 @@
     // When the web content tries to open a new window, override and load
     // the target URL in the existing webView instead of creating a new one.
     if (navigationAction.request.URL) {
-        [webView loadRequest:navigationAction.request];
+        self.activeNavigation = [webView loadRequest:navigationAction.request];
     }
     return nil;
 }
@@ -321,6 +332,8 @@
 // Handle provisional failures (e.g., too many redirects, network interruptions)
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error
 {
+    if (navigation && self.activeNavigation && navigation != self.activeNavigation) return;
+    if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) return;
     NSLog(@"[WebViewController] provisional navigation failed: %@", error);
 
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorHTTPTooManyRedirects) {
@@ -340,10 +353,12 @@
             // Recreate mutable request to ensure bodies/headers preserved for POST etc.
             NSMutableURLRequest *r = [lastReq mutableCopy];
             r.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+            NSUInteger generation = self.navigationGeneration;
 
             // Small delay to avoid tight retry loop
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self.webView loadRequest:r];
+                if (generation != self.navigationGeneration) return;
+                self.activeNavigation = [self.webView loadRequest:r];
             });
             return;
         }
@@ -365,6 +380,7 @@
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
 {
+    if (navigation && self.activeNavigation && navigation != self.activeNavigation) return;
     NSLog(@"[WebViewController] finished loading: %@", webView.URL);
     // Reset retry counters after a successful load
     self.provisionalRetryCount = 0;
@@ -406,6 +422,7 @@
 {
     if (!url) return;
     self.fallbackInProgress = YES;
+    self.fallbackGeneration = self.navigationGeneration;
     self.fallbackRedirectCount = 0;
     self.fallbackData = [NSMutableData data];
 
@@ -428,7 +445,7 @@
     if (data && data.length > 0) {
         NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (html) {
-            [self.webView loadHTMLString:html baseURL:baseURL];
+            self.activeNavigation = [self.webView loadHTMLString:html baseURL:baseURL];
             return;
         }
     }
@@ -436,7 +453,7 @@
     // If we couldn't get HTML, as a last resort try to load the URL directly in the webview (may show an error again)
     if (baseURL) {
         NSURLRequest *r = [NSURLRequest requestWithURL:baseURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:WebViewConfigNavigationTimeout];
-        [self.webView loadRequest:r];
+        self.activeNavigation = [self.webView loadRequest:r];
     }
 }
 
@@ -444,11 +461,13 @@
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data
 {
+    if (session != self.fallbackSession || self.fallbackGeneration != self.navigationGeneration) return;
     [self.fallbackData appendData:data];
 }
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
+    if (session != self.fallbackSession || self.fallbackGeneration != self.navigationGeneration) return;
     if (error) {
         NSLog(@"[WebViewController] fallback session failed: %@", error);
     }
@@ -460,6 +479,10 @@
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler
 {
+    if (session != self.fallbackSession || self.fallbackGeneration != self.navigationGeneration) {
+        completionHandler(nil);
+        return;
+    }
     // Track redirects and allow up to a certain number; after that stop following and finish with last data
     self.fallbackRedirectCount++;
     const NSInteger kMaxRedirects = 15;
