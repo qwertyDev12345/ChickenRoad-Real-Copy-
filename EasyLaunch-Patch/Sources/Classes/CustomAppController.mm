@@ -78,8 +78,14 @@
     }
 
     if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) return nil;
-    if (![urlStr hasSuffix:@"/"]) urlStr = [urlStr stringByAppendingString:@"/"];
-    return [NSURL URLWithString:urlStr];
+
+    NSURL *url = [NSURL URLWithString:urlStr];
+    NSString *scheme = url.scheme.lowercaseString;
+    if (!url || (! [scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"])) {
+        NSLog(@"[CustomAppController] Ignoring invalid push URL: %@", urlStr);
+        return nil;
+    }
+    return url;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +194,12 @@
 
 - (void)pl_openURL:(NSURL *)url
 {
+    if (!url) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self pl_openURL:url]; });
+        return;
+    }
+
     // Ищем topmost presented view controller и показываем WebView поверх.
     // Перебираем все windows чтобы найти активный ключевой — используем keyWindow.
     UIWindow *keyWin = nil;
@@ -210,14 +222,27 @@
     while (top.presentedViewController) {
         top = top.presentedViewController;
     }
-    if (!top) return;
+    if (!top || !top.view.window) {
+        // A notification tap can arrive before SceneDelegate has attached a window.
+        // Keep it for showPreloadScreenForScene: instead of presenting into an
+        // incomplete hierarchy (the first-push cold-start race).
+        self.pendingPushURL = url;
+        NSLog(@"[CustomAppController] UI not ready; deferred push URL");
+        return;
+    }
 
     // Если уже открыт WebViewController с этим же URL — не открываем повторно
     if ([top isKindOfClass:[WebViewController class]]) {
-        NSLog(@"[CustomAppController] pl_openURL: replacing existing WebViewController with push URL");
-        [top dismissViewControllerAnimated:NO completion:^{
-            [self pl_openURL:url];
-        }];
+        // Reuse the controller. Dismissing and immediately recreating WKWebView
+        // races its KVO teardown and was the source of first push-tap crashes.
+        NSLog(@"[CustomAppController] pl_openURL: navigating existing WebViewController");
+        [(WebViewController *)top navigateToURL:url];
+        return;
+    }
+
+    if (top.isBeingPresented || top.isBeingDismissed || top.transitionCoordinator) {
+        self.pendingPushURL = url;
+        NSLog(@"[CustomAppController] UI transition in progress; deferred push URL");
         return;
     }
 
@@ -379,6 +404,16 @@
 {
     UNUserNotificationCenter.currentNotificationCenter.delegate = self;
     [super applicationDidBecomeActive:application];
+
+    // A push tap may have arrived while the scene/window was still inactive.
+    // Once the hierarchy is attached, consume that deferred URL exactly once.
+    if (self.pendingPushURL &&
+        self.engineLoadState >= kUnityEngineLoadStateCoreInitialized &&
+        !self.preloadInProgress) {
+        NSURL *url = self.pendingPushURL;
+        self.pendingPushURL = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{ [self pl_openURL:url]; });
+    }
 }
 
 @end

@@ -34,6 +34,31 @@
     return self;
 }
 
+- (void)navigateToURL:(NSURL *)url
+{
+    if (!url) return;
+
+    void (^navigate)(void) = ^{
+        self.url = url;
+        if (!self.isViewLoaded || !self.webView) return;
+
+        self.fallbackInProgress = NO;
+        self.fallbackRedirectCount = 0;
+        self.provisionalRetryCount = 0;
+        self.failRetryCount = 0;
+        [self.fallbackSession invalidateAndCancel];
+        self.fallbackSession = nil;
+
+        NSURLRequest *request = [NSURLRequest requestWithURL:url
+                                                cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                            timeoutInterval:WebViewConfigNavigationTimeout];
+        [self.webView loadRequest:request];
+    };
+
+    if ([NSThread isMainThread]) navigate();
+    else dispatch_async(dispatch_get_main_queue(), navigate);
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];

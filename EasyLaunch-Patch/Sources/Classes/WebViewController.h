@@ -15,6 +15,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Вызывается при закрытии контроллера (напр., чтобы продолжить запуск Unity)
 @property (nonatomic, copy, nullable) void (^onClose)(void);
 
+/// Opens a new URL in the existing web view. Safe to call before viewDidLoad.
+- (void)navigateToURL:(NSURL *)url;
+
 @end
 
 NS_ASSUME_NONNULL_END
