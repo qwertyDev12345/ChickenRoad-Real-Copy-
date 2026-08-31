@@ -3,18 +3,11 @@
 #import "ScreenCaptureBlocker.h"
 #import <WebKit/WebKit.h>
 
-@interface WebViewController () <WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate, UIScrollViewDelegate>
+@interface WebViewController () <WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate>
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, strong) NSURL *url;
 
-// Track navigation requests (redirect chain)
-@property (nonatomic, strong) NSMutableArray<NSURLRequest *> *redirectRequests;
-@property (nonatomic, assign) NSInteger provisionalRetryCount;
-@property (nonatomic, assign) NSInteger maxProvisionalRetries;
-// Retry counter for didFailNavigation (non-TooManyRedirects) to prevent infinite loops
-@property (nonatomic, assign) NSInteger failRetryCount;
 @property (nonatomic, assign) NSUInteger navigationGeneration;
-@property (nonatomic, strong) WKNavigation *activeNavigation;
 
 @end
 
@@ -41,14 +34,11 @@
         if (!self.isViewLoaded || !self.webView) return;
 
         [self.webView stopLoading];
-        self.provisionalRetryCount = 0;
-        self.failRetryCount = 0;
-        [self.redirectRequests removeAllObjects];
 
         NSURLRequest *request = [NSURLRequest requestWithURL:url
                                                 cachePolicy:NSURLRequestReloadIgnoringCacheData
                                             timeoutInterval:WebViewConfigNavigationTimeout];
-        self.activeNavigation = [self.webView loadRequest:request];
+        [self.webView loadRequest:request];
     };
 
     if ([NSThread isMainThread]) navigate();
@@ -69,35 +59,6 @@
     } else {
         cfg.requiresUserActionForMediaPlayback = NO;
     }
-
-    // Inject a viewport meta override to disable user scaling (pinch/zoom)
-    WKUserContentController *ucc = [WKUserContentController new];
-    // Lock viewport, block gesture/multi-touch events and keep viewport locked via interval
-    NSString *noZoomJS = @"(function(){"
-        "function lockViewport(){"
-            "var meta=document.querySelector('meta[name=viewport]');"
-            "if(!meta){meta=document.createElement('meta');meta.name='viewport';document.head.appendChild(meta);}"
-            "meta.content='width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no';"
-        "}"
-        "lockViewport();"
-        "setInterval(lockViewport,500);"
-        "document.addEventListener('gesturestart',function(e){e.preventDefault();},{passive:false});"
-        "document.addEventListener('gesturechange',function(e){e.preventDefault();},{passive:false});"
-        "document.addEventListener('gestureend',function(e){e.preventDefault();},{passive:false});"
-        "document.addEventListener('touchmove',function(e){if(e.touches.length>1){e.preventDefault();}},{passive:false});"
-    "})();";
-    WKUserScript *script = [[WKUserScript alloc] initWithSource:noZoomJS injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES];
-    [ucc addUserScript:script];
-    // Also apply after document loads in case the page overrides viewport
-    WKUserScript *scriptEnd = [[WKUserScript alloc] initWithSource:noZoomJS injectionTime:WKUserScriptInjectionTimeAtDocumentEnd forMainFrameOnly:YES];
-    [ucc addUserScript:scriptEnd];
-
-    // Inject JS to enable inline autoplay for <video> elements: add playsinline, webkit-playsinline, muted and autoplay attributes
-    NSString *videoAutoJS = @"(function(){function enableVideos(){try{var vids=document.querySelectorAll('video');for(var i=0;i<vids.length;i++){var v=vids[i];v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');v.muted=true;v.setAttribute('muted','');v.setAttribute('autoplay','');v.setAttribute('preload','auto');var p=v.play(); if(p && typeof p.then==='function'){p.catch(function(){/*ignore*/});}}}catch(e){} } if (document.readyState==='complete' || document.readyState==='interactive'){enableVideos();} else {document.addEventListener('DOMContentLoaded', enableVideos);} var obs=new MutationObserver(enableVideos); try{obs.observe(document.documentElement||document.body,{childList:true,subtree:true});}catch(e){} })();";
-    WKUserScript *script2 = [[WKUserScript alloc] initWithSource:videoAutoJS injectionTime:WKUserScriptInjectionTimeAtDocumentEnd forMainFrameOnly:YES];
-    [ucc addUserScript:script2];
-
-    cfg.userContentController = ucc;
 
     self.webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:cfg];
     // Ensure any transparent parts show black background
@@ -120,32 +81,12 @@
     ]];
 
     // Hard-lock scroll view zoom scale so pinch-to-zoom is impossible
-    self.webView.scrollView.delegate = self;
     self.webView.scrollView.minimumZoomScale = 1.0;
     self.webView.scrollView.maximumZoomScale = 1.0;
-    // Disable pinch/rotate/double-tap zoom gestures but keep scrolling
-    // Disable pinch on scrollView directly
+    // The page's viewport controls zoom; disabling the native pinch recognizer
+    // is enough and does not interfere with taps or JavaScript navigation.
     if (self.webView.scrollView.pinchGestureRecognizer) {
         self.webView.scrollView.pinchGestureRecognizer.enabled = NO;
-    }
-    // Disable other gesture recognizers that enable scaling/rotation/double-tap
-    for (UIGestureRecognizer *g in self.webView.gestureRecognizers) {
-        if ([g isKindOfClass:[UIPinchGestureRecognizer class]] || [g isKindOfClass:[UIRotationGestureRecognizer class]]) {
-            g.enabled = NO;
-        }
-        if ([g isKindOfClass:[UITapGestureRecognizer class]]) {
-            UITapGestureRecognizer *t = (UITapGestureRecognizer *)g;
-            if (t.numberOfTapsRequired >= 2) t.enabled = NO;
-        }
-    }
-    for (UIGestureRecognizer *g in self.webView.scrollView.gestureRecognizers) {
-        if ([g isKindOfClass:[UIPinchGestureRecognizer class]] || [g isKindOfClass:[UIRotationGestureRecognizer class]]) {
-            g.enabled = NO;
-        }
-        if ([g isKindOfClass:[UITapGestureRecognizer class]]) {
-            UITapGestureRecognizer *t = (UITapGestureRecognizer *)g;
-            if (t.numberOfTapsRequired >= 2) t.enabled = NO;
-        }
     }
 
     // Add left-edge pan gesture to navigate back in web view history
@@ -162,14 +103,9 @@
         }
     }
 
-    // Prepare redirect tracking and retry policy
-    self.redirectRequests = [NSMutableArray new];
-    self.provisionalRetryCount = 0;
-    self.maxProvisionalRetries = 3; // safe default
-
     if (self.url) {
         NSURLRequest *req = [NSURLRequest requestWithURL:self.url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:WebViewConfigNavigationTimeout];
-        self.activeNavigation = [self.webView loadRequest:req];
+        [self.webView loadRequest:req];
     }
 }
 
@@ -189,7 +125,6 @@
 #pragma mark - WKNavigationDelegate
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error
 {
-    if (navigation && self.activeNavigation && navigation != self.activeNavigation) return;
     // Ignore cancellations (e.g. triggered by our own decidePolicyForNavigationAction)
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
         return;
@@ -198,31 +133,8 @@
     NSLog(@"[WebViewController] navigation error (domain=%@ code=%ld): %@",
           error.domain, (long)error.code, error.localizedDescription);
 
-    if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorHTTPTooManyRedirects) {
-        // A real redirect loop must stop. Replaying it through NSURLSession and
-        // injecting partial HTML causes another loop and can terminate WebKit.
-        NSLog(@"[WebViewController] redirect limit reached; navigation stopped");
-    } else {
-        // For other transient network errors, retry with a cap to avoid infinite loops.
-        // This covers cases where a 301/302 redirect destination is temporarily unreachable.
-        const NSInteger kMaxFailRetries = 3;
-        if (self.failRetryCount >= kMaxFailRetries) {
-            NSLog(@"[WebViewController] navigation error: retry cap reached");
-            return;
-        }
-        self.failRetryCount++;
-        NSUInteger generation = self.navigationGeneration;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (generation != self.navigationGeneration) return;
-            NSURL *target = webView.URL ?: self.url;
-            if (target) {
-                NSURLRequest *req = [NSURLRequest requestWithURL:target
-                                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                timeoutInterval:WebViewConfigNavigationTimeout];
-                self.activeNavigation = [webView loadRequest:req];
-            }
-        });
-    }
+    // WebKit owns redirect and recovery semantics. Retrying a failed navigation
+    // here can race a newer push navigation and crash the web-content process.
 }
 
 // Track navigation actions (this provides the redirect chain)
@@ -257,16 +169,12 @@
         }
     }
 
-    if (navigationAction.request) {
-        // Append the request to the chain (keep a reasonable cap)
-        const NSUInteger kMaxChain = 128;
-        if (self.redirectRequests.count >= kMaxChain) {
-            [self.redirectRequests removeObjectAtIndex:0];
-        }
-        [self.redirectRequests addObject:navigationAction.request];
-        if (!navigationAction.targetFrame || navigationAction.targetFrame.isMainFrame) {
-            self.url = requestURL;
-        }
+    // Let WebKit perform ordinary links, JavaScript navigation and every
+    // HTTP redirect itself. Reissuing a link request from inside this delegate
+    // can cancel the redirect chain that the page has just started.
+    if (requestURL && (!navigationAction.targetFrame || navigationAction.targetFrame.isMainFrame)) {
+        self.navigationGeneration++;
+        self.url = requestURL;
     }
 
     decisionHandler(WKNavigationActionPolicyAllow);
@@ -279,9 +187,9 @@
     // When the web content tries to open a new window, override and load
     // the target URL in the existing webView instead of creating a new one.
     if (navigationAction.request.URL) {
+        self.navigationGeneration++;
         self.url = navigationAction.request.URL;
-        [self.redirectRequests removeAllObjects];
-        self.activeNavigation = [webView loadRequest:navigationAction.request];
+        [webView loadRequest:navigationAction.request];
     }
     return nil;
 }
@@ -289,51 +197,15 @@
 // Handle provisional failures (e.g., too many redirects, network interruptions)
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error
 {
-    if (navigation && self.activeNavigation && navigation != self.activeNavigation) return;
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) return;
     NSLog(@"[WebViewController] provisional navigation failed: %@", error);
-
-    if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorHTTPTooManyRedirects) {
-        // Retry the last main-frame request at most a few times. WKWebView itself
-        // follows valid 3xx redirects; this branch is only for a genuine loop.
-        NSURLRequest *lastReq = [self.redirectRequests lastObject];
-        if (lastReq && self.provisionalRetryCount < self.maxProvisionalRetries) {
-            self.provisionalRetryCount++;
-            NSLog(@"[WebViewController] retrying from last redirect request (attempt %ld)", (long)self.provisionalRetryCount);
-
-            // Clear recorded chain and start new chain from lastReq preserving its method/headers/body
-            [self.redirectRequests removeAllObjects];
-
-            // Recreate mutable request to ensure bodies/headers preserved for POST etc.
-            NSMutableURLRequest *r = [lastReq mutableCopy];
-            r.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-            NSUInteger generation = self.navigationGeneration;
-
-            // Small delay to avoid tight retry loop
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (generation != self.navigationGeneration) return;
-                self.activeNavigation = [self.webView loadRequest:r];
-            });
-            return;
-        }
-
-        NSLog(@"[WebViewController] redirect retry cap reached");
-    } else {
-        // Do not replace a failed WebKit navigation with downloaded HTML: that
-        // loses cookies, POST bodies, JS context and redirect semantics.
-        NSLog(@"[WebViewController] provisional navigation stopped without fallback");
-    }
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
 {
-    if (navigation && self.activeNavigation && navigation != self.activeNavigation) return;
     NSLog(@"[WebViewController] finished loading: %@", webView.URL);
     // Reset retry counters after a successful load
-    self.provisionalRetryCount = 0;
-    self.failRetryCount = 0;
-    // WKWebView resets scrollView delegate and zoom limits after each load — restore them
-    webView.scrollView.delegate = self;
+    // Restore only zoom limits; never replace WKWebView's internal scroll delegate.
     webView.scrollView.minimumZoomScale = 1.0;
     webView.scrollView.maximumZoomScale = 1.0;
     webView.scrollView.zoomScale = 1.0;
@@ -344,8 +216,6 @@
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView
 {
     NSLog(@"[WebViewController] WKWebView content process terminated — reloading");
-    self.provisionalRetryCount = 0;
-    [self.redirectRequests removeAllObjects];
     NSUInteger generation = self.navigationGeneration;
     // Brief delay to let the process fully clean up before reloading
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -354,12 +224,12 @@
             NSURLRequest *req = [NSURLRequest requestWithURL:webView.URL
                                                 cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                             timeoutInterval:WebViewConfigNavigationTimeout];
-            self.activeNavigation = [webView loadRequest:req];
+            [webView loadRequest:req];
         } else if (self.url) {
             NSURLRequest *req = [NSURLRequest requestWithURL:self.url
                                                 cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                             timeoutInterval:WebViewConfigNavigationTimeout];
-            self.activeNavigation = [webView loadRequest:req];
+            [webView loadRequest:req];
         }
     });
 }
@@ -379,12 +249,6 @@
 {
     // Allow the web view's own gestures (scrolling) to work alongside the edge pan
     return YES;
-}
-
-#pragma mark - UIScrollViewDelegate
-
-- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
-    return nil;
 }
 
 - (void)viewWillAppear:(BOOL)animated {

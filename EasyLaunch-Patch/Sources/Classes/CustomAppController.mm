@@ -31,6 +31,7 @@
 /// Monotonically increasing id of the last notification tap. It prevents an
 /// older deferred UI transition from opening after a newer notification tap.
 @property (nonatomic, assign) NSUInteger pushTapGeneration;
+@property (nonatomic, strong, nullable) NSURL *coldStartPushURL;
 
 - (void)pl_openURL:(NSURL *)url
         generation:(NSUInteger)generation
@@ -68,12 +69,18 @@
 
     // 1. Корень payload: userInfo["url"]
     NSString *urlStr = userInfo[@"url"];
+    if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
+        urlStr = userInfo[@"click_url"];
+    }
 
     // 2. FCM data payload: userInfo["data"]["url"]
     if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
         NSDictionary *data = userInfo[@"data"];
         if ([data isKindOfClass:[NSDictionary class]]) {
             urlStr = data[@"url"];
+            if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
+                urlStr = data[@"click_url"];
+            }
         }
     }
 
@@ -82,6 +89,9 @@
         NSDictionary *aps = userInfo[@"aps"];
         if ([aps isKindOfClass:[NSDictionary class]]) {
             urlStr = aps[@"url"];
+            if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
+                urlStr = aps[@"click_url"];
+            }
         }
     }
 
@@ -107,6 +117,14 @@
     NSDictionary *remoteNotif = launchOptions[UIApplicationLaunchOptionsRemoteNotificationKey];
     if (remoteNotif) {
         self.pendingPushURL = [CustomAppController pl_pushURLFromUserInfo:remoteNotif];
+        self.coldStartPushURL = self.pendingPushURL;
+        NSURL *capturedColdURL = self.coldStartPushURL;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if ([self.coldStartPushURL.absoluteString isEqualToString:capturedColdURL.absoluteString]) {
+                self.coldStartPushURL = nil;
+            }
+        });
         if (self.pendingPushURL) {
             NSLog(@"[CustomAppController] Cold-start push URL: %@", self.pendingPushURL);
             // Пуш открыл приложение — preload сам обработает pendingPushURL через showPreloadScreenForScene
@@ -137,8 +155,16 @@
     NSDictionary *userInfo = response.notification.request.content.userInfo;
     NSURL *pushURL = [CustomAppController pl_pushURLFromUserInfo:userInfo];
 
-
     if (pushURL) {
+        // On a cold start iOS may expose the same notification both through
+        // launchOptions and UNUserNotificationCenterDelegate. The launch path
+        // already owns it; processing it twice can present/navigate two WebViews.
+        if (self.coldStartPushURL && [self.coldStartPushURL.absoluteString isEqualToString:pushURL.absoluteString]) {
+            NSLog(@"[CustomAppController] Ignoring duplicate cold-start push response: %@", pushURL);
+            self.coldStartPushURL = nil;
+            completionHandler();
+            return;
+        }
         NSLog(@"[CustomAppController] Push tap URL: %@", pushURL);
         dispatch_async(dispatch_get_main_queue(), ^{
             NSUInteger generation = ++self.pushTapGeneration;
@@ -253,15 +279,6 @@
         return;
     }
 
-    // Если WebViewController уже открыт — загружаем URL именно текущего tap.
-    if ([top isKindOfClass:[WebViewController class]]) {
-        // Reuse the controller. Dismissing and immediately recreating WKWebView
-        // races its KVO teardown and was the source of first push-tap crashes.
-        NSLog(@"[CustomAppController] pl_openURL: navigating existing WebViewController");
-        [(WebViewController *)top navigateToURL:url];
-        return;
-    }
-
     if (top.isBeingPresented || top.isBeingDismissed || top.transitionCoordinator) {
         id<UIViewControllerTransitionCoordinator> coordinator = top.transitionCoordinator;
         if (coordinator) {
@@ -274,6 +291,15 @@
                 [self pl_openURL:url generation:generation retryCount:retryCount + 1];
             });
         }
+        return;
+    }
+
+    // Если WebViewController уже открыт — загружаем URL именно текущего tap.
+    if ([top isKindOfClass:[WebViewController class]]) {
+        // Reuse the controller. Dismissing and immediately recreating WKWebView
+        // races its KVO teardown and was the source of first push-tap crashes.
+        NSLog(@"[CustomAppController] pl_openURL: navigating existing WebViewController");
+        [(WebViewController *)top navigateToURL:url];
         return;
     }
 
