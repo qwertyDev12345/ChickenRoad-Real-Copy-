@@ -3,15 +3,9 @@
 #import "ScreenCaptureBlocker.h"
 #import <WebKit/WebKit.h>
 
-@interface WebViewController () <WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate, NSURLSessionDataDelegate, UIScrollViewDelegate>
+@interface WebViewController () <WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate, UIScrollViewDelegate>
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, strong) NSURL *url;
-
-// Fallback loading state when WKWebView fails with redirect errors
-@property (nonatomic, strong) NSURLSession *fallbackSession;
-@property (nonatomic, strong) NSMutableData *fallbackData;
-@property (nonatomic, assign) NSInteger fallbackRedirectCount;
-@property (nonatomic, assign) BOOL fallbackInProgress;
 
 // Track navigation requests (redirect chain)
 @property (nonatomic, strong) NSMutableArray<NSURLRequest *> *redirectRequests;
@@ -20,7 +14,6 @@
 // Retry counter for didFailNavigation (non-TooManyRedirects) to prevent infinite loops
 @property (nonatomic, assign) NSInteger failRetryCount;
 @property (nonatomic, assign) NSUInteger navigationGeneration;
-@property (nonatomic, assign) NSUInteger fallbackGeneration;
 @property (nonatomic, strong) WKNavigation *activeNavigation;
 
 @end
@@ -48,13 +41,8 @@
         if (!self.isViewLoaded || !self.webView) return;
 
         [self.webView stopLoading];
-        self.fallbackInProgress = NO;
-        self.fallbackRedirectCount = 0;
         self.provisionalRetryCount = 0;
         self.failRetryCount = 0;
-        [self.fallbackSession invalidateAndCancel];
-        self.fallbackSession = nil;
-        self.fallbackData = nil;
         [self.redirectRequests removeAllObjects];
 
         NSURLRequest *request = [NSURLRequest requestWithURL:url
@@ -135,9 +123,6 @@
     self.webView.scrollView.delegate = self;
     self.webView.scrollView.minimumZoomScale = 1.0;
     self.webView.scrollView.maximumZoomScale = 1.0;
-    // KVO: catch any programmatic zoom changes that bypass the delegate
-    [self.webView.scrollView addObserver:self forKeyPath:@"zoomScale" options:NSKeyValueObservingOptionNew context:NULL];
-
     // Disable pinch/rotate/double-tap zoom gestures but keep scrolling
     // Disable pinch on scrollView directly
     if (self.webView.scrollView.pinchGestureRecognizer) {
@@ -184,8 +169,6 @@
 
     if (self.url) {
         NSURLRequest *req = [NSURLRequest requestWithURL:self.url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:WebViewConfigNavigationTimeout];
-        self.fallbackInProgress = NO;
-        self.fallbackRedirectCount = 0;
         self.activeNavigation = [self.webView loadRequest:req];
     }
 }
@@ -196,23 +179,6 @@
     // Применяем защиту от захвата экрана после того, как view добавлена в окно.
     // Метод CALayer-swap требует, чтобы view уже была в иерархии.
     // [ScreenCaptureBlocker applyProtectionToLayer:self.webView.layer];
-}
-
-- (void)dealloc
-{
-    [self.webView.scrollView removeObserver:self forKeyPath:@"zoomScale" context:NULL];
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context
-{
-    if ([keyPath isEqualToString:@"zoomScale"]) {
-        CGFloat z = [change[NSKeyValueChangeNewKey] floatValue];
-        if (fabs(z - 1.0) > 0.001) {
-            ((UIScrollView *)object).zoomScale = 1.0;
-        }
-        return;
-    }
-    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
 }
 
 - (void)onCloseTapped
@@ -233,19 +199,15 @@
           error.domain, (long)error.code, error.localizedDescription);
 
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorHTTPTooManyRedirects) {
-        // Too-many-redirects: hand off to the NSURLSession-based fallback
-        if (!self.fallbackInProgress && self.url) {
-            [self startFallbackLoadForURL:self.url];
-        }
+        // A real redirect loop must stop. Replaying it through NSURLSession and
+        // injecting partial HTML causes another loop and can terminate WebKit.
+        NSLog(@"[WebViewController] redirect limit reached; navigation stopped");
     } else {
         // For other transient network errors, retry with a cap to avoid infinite loops.
         // This covers cases where a 301/302 redirect destination is temporarily unreachable.
         const NSInteger kMaxFailRetries = 3;
         if (self.failRetryCount >= kMaxFailRetries) {
-            NSLog(@"[WebViewController] navigation error: retry cap reached, switching to fallback");
-            if (!self.fallbackInProgress && self.url) {
-                [self startFallbackLoadForURL:self.url];
-            }
+            NSLog(@"[WebViewController] navigation error: retry cap reached");
             return;
         }
         self.failRetryCount++;
@@ -295,16 +257,6 @@
         }
     }
 
-    // Navigation with no frame (window.open / target="_blank") that wasn't caught
-    // by createWebViewWithConfiguration: — load in the current webView.
-    if (!navigationAction.targetFrame) {
-        if (requestURL) {
-            self.activeNavigation = [webView loadRequest:navigationAction.request];
-        }
-        decisionHandler(WKNavigationActionPolicyCancel);
-        return;
-    }
-
     if (navigationAction.request) {
         // Append the request to the chain (keep a reasonable cap)
         const NSUInteger kMaxChain = 128;
@@ -312,6 +264,9 @@
             [self.redirectRequests removeObjectAtIndex:0];
         }
         [self.redirectRequests addObject:navigationAction.request];
+        if (!navigationAction.targetFrame || navigationAction.targetFrame.isMainFrame) {
+            self.url = requestURL;
+        }
     }
 
     decisionHandler(WKNavigationActionPolicyAllow);
@@ -324,6 +279,8 @@
     // When the web content tries to open a new window, override and load
     // the target URL in the existing webView instead of creating a new one.
     if (navigationAction.request.URL) {
+        self.url = navigationAction.request.URL;
+        [self.redirectRequests removeAllObjects];
         self.activeNavigation = [webView loadRequest:navigationAction.request];
     }
     return nil;
@@ -337,12 +294,9 @@
     NSLog(@"[WebViewController] provisional navigation failed: %@", error);
 
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorHTTPTooManyRedirects) {
-        // Try to recover by restarting from the last request in the redirect chain
+        // Retry the last main-frame request at most a few times. WKWebView itself
+        // follows valid 3xx redirects; this branch is only for a genuine loop.
         NSURLRequest *lastReq = [self.redirectRequests lastObject];
-        if (!lastReq && self.url) {
-            lastReq = [NSURLRequest requestWithURL:self.url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:WebViewConfigNavigationTimeout];
-        }
-
         if (lastReq && self.provisionalRetryCount < self.maxProvisionalRetries) {
             self.provisionalRetryCount++;
             NSLog(@"[WebViewController] retrying from last redirect request (attempt %ld)", (long)self.provisionalRetryCount);
@@ -363,18 +317,11 @@
             return;
         }
 
-        // If retries exhausted, fall back to NSURLSession-based loader
-        if (!self.fallbackInProgress && self.url) {
-            [self startFallbackLoadForURL:self.url];
-        }
+        NSLog(@"[WebViewController] redirect retry cap reached");
     } else {
-        // Non-TooManyRedirects provisional failure: DNS fail, SSL error, connection refused, etc.
-        // Commonly happens when a 301/302 redirect destination is unreachable.
-        // Go straight to NSURLSession fallback which manually follows the redirect chain.
-        NSLog(@"[WebViewController] provisional navigation failed with non-redirect error — using fallback loader");
-        if (!self.fallbackInProgress && self.url) {
-            [self startFallbackLoadForURL:self.url];
-        }
+        // Do not replace a failed WebKit navigation with downloaded HTML: that
+        // loses cookies, POST bodies, JS context and redirect semantics.
+        NSLog(@"[WebViewController] provisional navigation stopped without fallback");
     }
 }
 
@@ -397,101 +344,24 @@
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView
 {
     NSLog(@"[WebViewController] WKWebView content process terminated — reloading");
-    self.fallbackInProgress = NO;
     self.provisionalRetryCount = 0;
     [self.redirectRequests removeAllObjects];
+    NSUInteger generation = self.navigationGeneration;
     // Brief delay to let the process fully clean up before reloading
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self.navigationGeneration) return;
         if (webView.URL) {
             NSURLRequest *req = [NSURLRequest requestWithURL:webView.URL
                                                 cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                             timeoutInterval:WebViewConfigNavigationTimeout];
-            [webView loadRequest:req];
+            self.activeNavigation = [webView loadRequest:req];
         } else if (self.url) {
             NSURLRequest *req = [NSURLRequest requestWithURL:self.url
                                                 cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                             timeoutInterval:WebViewConfigNavigationTimeout];
-            [webView loadRequest:req];
+            self.activeNavigation = [webView loadRequest:req];
         }
     });
-}
-
-#pragma mark - Fallback loader (NSURLSession)
-
-- (void)startFallbackLoadForURL:(NSURL *)url
-{
-    if (!url) return;
-    self.fallbackInProgress = YES;
-    self.fallbackGeneration = self.navigationGeneration;
-    self.fallbackRedirectCount = 0;
-    self.fallbackData = [NSMutableData data];
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
-    // Create session with self as delegate to track redirects
-    self.fallbackSession = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:[NSOperationQueue mainQueue]];
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:30.0];
-    NSURLSessionDataTask *task = [self.fallbackSession dataTaskWithRequest:req];
-    [task resume];
-}
-
-- (void)finishFallbackLoadWithData:(NSData *)data mimeType:(NSString *)mime baseURL:(NSURL *)baseURL error:(NSError *)error
-{
-    self.fallbackInProgress = NO;
-    [self.fallbackSession invalidateAndCancel];
-    self.fallbackSession = nil;
-
-    if (data && data.length > 0) {
-        NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        if (html) {
-            self.activeNavigation = [self.webView loadHTMLString:html baseURL:baseURL];
-            return;
-        }
-    }
-
-    // If we couldn't get HTML, as a last resort try to load the URL directly in the webview (may show an error again)
-    if (baseURL) {
-        NSURLRequest *r = [NSURLRequest requestWithURL:baseURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:WebViewConfigNavigationTimeout];
-        self.activeNavigation = [self.webView loadRequest:r];
-    }
-}
-
-#pragma mark - NSURLSessionDataDelegate
-
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data
-{
-    if (session != self.fallbackSession || self.fallbackGeneration != self.navigationGeneration) return;
-    [self.fallbackData appendData:data];
-}
-
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
-{
-    if (session != self.fallbackSession || self.fallbackGeneration != self.navigationGeneration) return;
-    if (error) {
-        NSLog(@"[WebViewController] fallback session failed: %@", error);
-    }
-    // Attempt to determine mime type from response
-    NSString *mime = nil;
-    NSURL *base = task.currentRequest.URL ?: self.url;
-    [self finishFallbackLoadWithData:self.fallbackData mimeType:mime baseURL:base error:error];
-}
-
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler
-{
-    if (session != self.fallbackSession || self.fallbackGeneration != self.navigationGeneration) {
-        completionHandler(nil);
-        return;
-    }
-    // Track redirects and allow up to a certain number; after that stop following and finish with last data
-    self.fallbackRedirectCount++;
-    const NSInteger kMaxRedirects = 15;
-    if (self.fallbackRedirectCount > kMaxRedirects) {
-        // Stop following redirects
-        completionHandler(nil);
-    } else {
-        completionHandler(request);
-    }
 }
 
 #pragma mark - Back gesture
