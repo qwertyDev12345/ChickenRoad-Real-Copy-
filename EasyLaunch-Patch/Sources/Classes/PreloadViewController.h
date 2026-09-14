@@ -72,6 +72,8 @@ typedef void (^PreloadOpenURLBlock)(NSURL *url);
 /// Если установлен до viewDidAppear — цепочка проверок пропускается и сразу
 /// вызывается onOpenURL с этим URL.
 @property (nonatomic, strong, nullable) NSURL *pendingPushURL;
+/// A preload run may hand control to the app only once.
+@property (nonatomic, assign, readonly) BOOL hasFinished;
 
 @end
 

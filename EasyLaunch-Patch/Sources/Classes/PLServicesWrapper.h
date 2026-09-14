@@ -1,5 +1,6 @@
 #pragma once
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -26,6 +27,8 @@ typedef void (^PLAttributionBlock)(NSDictionary * _Nullable attribution, NSError
 
 /// YES если Firebase сконфигурирован.
 + (BOOL)isFirebaseConfigured;
+/// Forward the APNs callback directly; Unity notification hooks are optional.
++ (void)setAPNsDeviceToken:(NSData *)deviceToken;
 
 // ── AppsFlyer ─────────────────────────────────────────────────────────────────
 

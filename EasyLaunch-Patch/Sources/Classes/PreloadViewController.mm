@@ -90,6 +90,9 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @interface PreloadViewController ()
+@property (nonatomic, assign) BOOL checksStarted;
+@property (nonatomic, assign) BOOL finishRequested;
+@property (nonatomic, assign, readwrite) BOOL hasFinished;
 
 /// Фоновое изображение
 @property (nonatomic, strong) UIImageView              *backgroundImageView;
@@ -147,6 +150,13 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
 - (void)startChecks
 {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self startChecks]; });
+        return;
+    }
+    // Fullscreen permission dismissal invokes viewDidAppear again.
+    if (self.checksStarted || self.hasFinished) return;
+    self.checksStarted = YES;
     self.attributionData = nil;
     self.noInternetView.hidden = YES;
     self.noInternetOverlay.hidden = YES;
@@ -154,12 +164,8 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     // ── Push-путь: приложение открыто тапом по уведомлению с URL ──────────────
     if (self.pendingPushURL) {
         NSURL *pushURL = self.pendingPushURL;
-        self.pendingPushURL = nil; // Сбрасываем после обработки
         NSLog(@"[PreloadVC] Using push URL: %@", pushURL);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.onOpenURL) self.onOpenURL(pushURL);
-            [self->_spinner stopAnimating];
-        });
+        [self pl_completeWithURL:pushURL];
         return;
     }
 
@@ -177,23 +183,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
         // и без задержки unity fast path успевает вызвать onComplete раньше.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (self.pendingPushURL) {
-                // Push пришёл пока ждали — открываем WebView вместо Unity
-                NSURL *pushURL = self.pendingPushURL;
-                self.pendingPushURL = nil;
-                NSLog(@"[PreloadVC] Push URL intercepted before Unity launch — switching to WebView: %@", pushURL);
-                [[NSUserDefaults standardUserDefaults] setObject:@"webview" forKey:@"PLLaunchMode"];
-                [[NSUserDefaults standardUserDefaults] synchronize];
-                [self pl_checkAndAskNotificationsIfNeededWithCompletion:^{
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [self->_spinner stopAnimating];
-                        if (self.onOpenURL) self.onOpenURL(pushURL);
-                    });
-                }];
-                return;
-            }
-            [self->_spinner stopAnimating];
-            if (self.onComplete) self.onComplete();
+            [self pl_completeWithURL:nil];
         });
         return;
     }
@@ -540,6 +530,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
                                     [[NSUserDefaults standardUserDefaults] synchronize];
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                         strongSelf.isPresentingNotificationPrompt = NO;
+                                        if (granted) [[UIApplication sharedApplication] registerForRemoteNotifications];
                                         completion();
                                     });
                                 }];
@@ -758,17 +749,13 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 /// `url != nil`  → показываем WebView (onOpenURL) — сначала запрашиваем уведомления (если не спрашивали в эту сессию)
 - (void)pl_finishWithURL:(nullable NSURL *)url
 {    
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        // ── Push-приоритет: проверяем на главном потоке после небольшой задержки. ──
-        // pl_finishWithURL: вызывается из фонового потока (URLSession completion), поэтому
-        // проверять pendingPushURL там небезопасно — didReceiveNotificationResponse: устанавливает
-        // его через dispatch_async(main_queue) и этот блок может ещё не выполниться.
-        // Проверка здесь, на main queue через 0.3с, гарантирует что пуш уже обработан.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.hasFinished || self.finishRequested) return;
+        self.finishRequested = YES;
+        // All routing state is read on main. Check it again after permission
+        // completion: a second push can arrive while that dialog is visible.
         if (self.pendingPushURL) {
             NSURL *pushURL = self.pendingPushURL;
-            self.pendingPushURL = nil;
             NSLog(@"[PreloadVC] Push URL received during chain — overriding server URL with: %@", pushURL);
             // Сохраняем режим запуска
             if (![[NSUserDefaults standardUserDefaults] stringForKey:@"PLLaunchMode"]) {
@@ -776,11 +763,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
                 [[NSUserDefaults standardUserDefaults] synchronize];
             }
             [self->_spinner stopAnimating];
-            [self pl_checkAndAskNotificationsIfNeededWithCompletion:^{
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (self.onOpenURL) self.onOpenURL(pushURL);
-                });
-            }];
+            [self pl_completeWithURL:pushURL];
             return;
         }
 
@@ -809,22 +792,33 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
             NSLog(@"[PreloadVC] WebView path — checking notification permission before opening URL");
             [self pl_checkAndAskNotificationsIfNeededWithCompletion:^{
                 NSLog(@"[PreloadVC] → opening URL: %@", useURL);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (self.onOpenURL) {
-                        self.onOpenURL(useURL);
-                    } else {
-                        [[UIApplication sharedApplication] openURL:useURL
-                                                           options:@{}
-                                                 completionHandler:nil];
-                    }
-                });
+                [self pl_completeWithURL:useURL];
             }];
         } else {
             // ── Unity path: уведомления не запрашиваем ──
             NSLog(@"[PreloadVC] → proceeding to Unity (no notification prompt)");
-            if (self.onComplete) self.onComplete();
+            [self pl_completeWithURL:nil];
         }
     });
+}
+
+- (void)pl_completeWithURL:(nullable NSURL *)url
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self pl_completeWithURL:url]; });
+        return;
+    }
+    if (self.hasFinished) return;
+    // Read the latest push after the permission flow, not a URL captured before it.
+    NSURL *destination = self.pendingPushURL ?: url;
+    self.pendingPushURL = nil;
+    self.hasFinished = YES;
+    [self->_spinner stopAnimating];
+    if (destination) {
+        if (self.onOpenURL) self.onOpenURL(destination);
+    } else if (self.onComplete) {
+        self.onComplete();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -835,6 +829,8 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 {
     NSLog(@"[PreloadVC] No internet — showing no connection UI");
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.hasFinished || self.finishRequested) return;
+        self.checksStarted = NO; // An explicit retry may start a new network check.
         [self->_spinner stopAnimating];
         self.noInternetOverlay.hidden = NO;
         self.noInternetView.hidden = NO;

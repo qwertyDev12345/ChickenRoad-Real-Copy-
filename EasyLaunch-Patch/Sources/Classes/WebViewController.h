@@ -5,8 +5,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Полноэкранный WKWebView контроллер без возможности dismissal.
 /// Поддерживает: редиректы, back-gesture (edge pan), video autoplay,
-/// fallback через NSURLSession при лимите редиректов WKWebView.
-@interface WebViewController : UIViewController <UIScrollViewDelegate>
+/// ограниченное продолжение длинных HTTP-цепочек внутри WKWebView.
+@interface WebViewController : UIViewController
 
 - (instancetype)initWithURL:(NSURL *)url NS_DESIGNATED_INITIALIZER;
 - (instancetype)initWithNibName:(nullable NSString *)nibName bundle:(nullable NSBundle *)bundle NS_UNAVAILABLE;

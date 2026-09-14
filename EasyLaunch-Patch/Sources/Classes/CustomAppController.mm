@@ -4,6 +4,7 @@
 #import "WebViewConfig.h"
 #import "EasyLaunchConfig.h"
 #import "ScreenCaptureBlocker.h"
+#import "PLServicesWrapper.h"
 #import <UserNotifications/UserNotifications.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +33,9 @@
 /// older deferred UI transition from opening after a newer notification tap.
 @property (nonatomic, assign) NSUInteger pushTapGeneration;
 @property (nonatomic, strong, nullable) NSURL *coldStartPushURL;
+@property (nonatomic, copy, nullable) NSString *coldStartMessageID;
+@property (nonatomic, strong, nullable) NSURL *deferredOpenURL;
+@property (nonatomic, assign) BOOL startingUnity;
 
 - (void)pl_openURL:(NSURL *)url
         generation:(NSUInteger)generation
@@ -65,7 +69,7 @@
 /// Ищет поле "url" в: корне payload → data словаре → aps словаре.
 + (nullable NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)userInfo
 {
-    if (!userInfo) return nil;
+    if (![userInfo isKindOfClass:NSDictionary.class]) return nil;
 
     // 1. Корень payload: userInfo["url"]
     NSString *urlStr = userInfo[@"url"];
@@ -99,7 +103,7 @@
 
     NSURL *url = [NSURL URLWithString:urlStr];
     NSString *scheme = url.scheme.lowercaseString;
-    if (!url || (! [scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"])) {
+    if (!url.host.length || (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"])) {
         NSLog(@"[CustomAppController] Ignoring invalid push URL: %@", urlStr);
         return nil;
     }
@@ -118,11 +122,14 @@
     if (remoteNotif) {
         self.pendingPushURL = [CustomAppController pl_pushURLFromUserInfo:remoteNotif];
         self.coldStartPushURL = self.pendingPushURL;
+        id messageID = remoteNotif[@"gcm.message_id"] ?: remoteNotif[@"google.message_id"];
+        self.coldStartMessageID = [messageID isKindOfClass:NSString.class] ? messageID : nil;
         NSURL *capturedColdURL = self.coldStartPushURL;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if ([self.coldStartPushURL.absoluteString isEqualToString:capturedColdURL.absoluteString]) {
                 self.coldStartPushURL = nil;
+                self.coldStartMessageID = nil;
             }
         });
         if (self.pendingPushURL) {
@@ -136,6 +143,14 @@
     // Устанавливаем делегат ПОСЛЕ super — иначе Unity перезапишет его в своём
     // didFinishLaunchingWithOptions.
     UNUserNotificationCenter.currentNotificationCenter.delegate = self;
+
+    // The push fast path skips preload's SDK chain, but APNs callbacks still arrive.
+    [PLServicesWrapper configureFirebase:nil];
+    NSLog(@"[EasyLaunch] routing revision 2026-09-14-r1; build %@",
+          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
+    NSLog(@"[EasyLaunch] source commit=%@ patch_sha256=%@",
+          [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"] ?: @"unknown",
+          [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchPatchSHA256"] ?: @"unknown");
 
     // Защита от захвата экрана
     //[[ScreenCaptureBlocker sharedBlocker] startProtecting];
@@ -155,24 +170,24 @@
     NSDictionary *userInfo = response.notification.request.content.userInfo;
     NSURL *pushURL = [CustomAppController pl_pushURLFromUserInfo:userInfo];
 
-    if (pushURL) {
-        // On a cold start iOS may expose the same notification both through
-        // launchOptions and UNUserNotificationCenterDelegate. The launch path
-        // already owns it; processing it twice can present/navigate two WebViews.
-        if (self.coldStartPushURL && [self.coldStartPushURL.absoluteString isEqualToString:pushURL.absoluteString]) {
-            NSLog(@"[CustomAppController] Ignoring duplicate cold-start push response: %@", pushURL);
-            self.coldStartPushURL = nil;
-            completionHandler();
-            return;
-        }
-        NSLog(@"[CustomAppController] Push tap URL: %@", pushURL);
+    if (pushURL && ![response.actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier]) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            // Deduplicate the same message, never two messages sharing a URL.
+            id messageID = userInfo[@"gcm.message_id"] ?: userInfo[@"google.message_id"];
+            if (self.coldStartMessageID && [messageID isKindOfClass:NSString.class] &&
+                [self.coldStartMessageID isEqualToString:messageID]) {
+                NSLog(@"[CustomAppController] Ignoring duplicate cold-start push response");
+                self.coldStartPushURL = nil;
+                self.coldStartMessageID = nil;
+                return;
+            }
+            NSLog(@"[CustomAppController] Push tap URL: %@", pushURL);
             NSUInteger generation = ++self.pushTapGeneration;
             PreloadViewController *preloadVC =
                 (PreloadViewController *)self.preloadWindow.rootViewController;
 
             if ([preloadVC isKindOfClass:[PreloadViewController class]]
-                && preloadVC.presentedViewController == nil) {
+                && !preloadVC.hasFinished) {
                 // Preload-экран активен и ещё не открыл WebView:
                 // передаём URL — startChecks или pl_finishWithURL его подхватят.
                 // Покрывает cold start + случай когда launchOptions не содержал URL.
@@ -218,9 +233,31 @@
     NSLog(@"[CustomAppController] didReceiveRemoteNotification: %@", userInfo);
     // Тап по уведомлению обрабатывается через userNotificationCenter:didReceiveNotificationResponse:
     // Здесь обрабатываем только фоновые data-пуши (content-available)
+#if UNITY_USES_REMOTE_NOTIFICATIONS
     [super application:application
         didReceiveRemoteNotification:userInfo
         fetchCompletionHandler:completionHandler];
+#else
+    // Unity omits this optional method entirely when its C# notification API
+    // is unused. An unconditional super call then raises unrecognized selector.
+    if (completionHandler) completionHandler(UIBackgroundFetchResultNoData);
+#endif
+}
+
+- (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken
+{
+    [PLServicesWrapper setAPNsDeviceToken:deviceToken];
+#if UNITY_USES_REMOTE_NOTIFICATIONS
+    [super application:application didRegisterForRemoteNotificationsWithDeviceToken:deviceToken];
+#endif
+}
+
+- (void)application:(UIApplication *)application didFailToRegisterForRemoteNotificationsWithError:(NSError *)error
+{
+    NSLog(@"[CustomAppController] APNs registration failed: %@", error);
+#if UNITY_USES_REMOTE_NOTIFICATIONS
+    [super application:application didFailToRegisterForRemoteNotificationsWithError:error];
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,6 +278,8 @@
 
     // Only the most recently tapped notification is allowed to navigate.
     if (generation != self.pushTapGeneration) return;
+    self.deferredOpenURL = url;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive || self.startingUnity) return;
 
     // Ищем topmost presented view controller и показываем WebView поверх.
     // Перебираем все windows чтобы найти активный ключевой — используем keyWindow.
@@ -283,7 +322,9 @@
         id<UIViewControllerTransitionCoordinator> coordinator = top.transitionCoordinator;
         if (coordinator) {
             [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
-                [self pl_openURL:url generation:generation retryCount:retryCount + 1];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self pl_openURL:url generation:generation retryCount:retryCount + 1];
+                });
             }];
         } else if (retryCount < 20) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
@@ -296,10 +337,10 @@
 
     // Если WebViewController уже открыт — загружаем URL именно текущего tap.
     if ([top isKindOfClass:[WebViewController class]]) {
-        // Reuse the controller. Dismissing and immediately recreating WKWebView
-        // races its KVO teardown and was the source of first push-tap crashes.
+        // Reuse the existing controller for the URL from this response.
         NSLog(@"[CustomAppController] pl_openURL: navigating existing WebViewController");
         [(WebViewController *)top navigateToURL:url];
+        self.deferredOpenURL = nil;
         return;
     }
 
@@ -313,6 +354,7 @@
         [weakSelf dismissPreloadAndStartUnity];
     };
     [top presentViewController:wvc animated:YES completion:nil];
+    self.deferredOpenURL = nil;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,21 +424,8 @@
 
         // Если сервер вернул URL — открыть во встроенном WebView
         vc.onOpenURL = ^(NSURL *url) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (url) {
-                    WebViewController *wvc = [[WebViewController alloc] initWithURL:url];
-                    __weak typeof(self) weakSelf2 = weakSelf;
-                    wvc.onClose = ^{
-                        [weakSelf2 dismissPreloadAndStartUnity];
-                    };
-                    // Present the WebViewController directly (no nav bar/header)
-                    wvc.modalPresentationStyle = UIModalPresentationFullScreen;
-                    if (@available(iOS 13.0, *)) {
-                        wvc.modalInPresentation = YES;
-                    }
-                    [preloadWindow.rootViewController presentViewController:wvc animated:YES completion:nil];
-                }
-            });
+            // Preload and runtime pushes share one serialized presentation path.
+            [weakSelf pl_openURL:url generation:weakSelf.pushTapGeneration retryCount:0];
         };
 
         preloadWindow.rootViewController = vc;
@@ -409,6 +438,8 @@
 {
     // Гарантируем выполнение на главном потоке
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.startingUnity || self.unityMode) return;
+        self.startingUnity = YES;
         UIWindow *preloadWindow = self.preloadWindow;
 
         // Плавное исчезновение preload-экрана
@@ -451,6 +482,10 @@
 
             // Теперь инициализируем Unity
             [super initUnityWithScene:self.pendingScene];
+            self.startingUnity = NO;
+            if (self.deferredOpenURL) {
+                [self pl_openURL:self.deferredOpenURL generation:self.pushTapGeneration retryCount:0];
+            }
         }];
     });
 }
@@ -461,6 +496,23 @@
 {
     UNUserNotificationCenter.currentNotificationCenter.delegate = self;
     [super applicationDidBecomeActive:application];
+    if (self.deferredOpenURL) {
+        [self pl_openURL:self.deferredOpenURL generation:self.pushTapGeneration retryCount:0];
+    }
+}
+
+// Unity's implementations call native runtime functions unconditionally.
+// In the web-only path initUnityWithScene: intentionally has not run yet.
+- (void)applicationDidEnterBackground:(UIApplication *)application
+{
+    if (self.engineLoadState >= kUnityEngineLoadStateAppReady)
+        [super applicationDidEnterBackground:application];
+}
+
+- (void)applicationDidReceiveMemoryWarning:(UIApplication *)application
+{
+    if (self.engineLoadState >= kUnityEngineLoadStateAppReady)
+        [super applicationDidReceiveMemoryWarning:application];
 }
 
 @end

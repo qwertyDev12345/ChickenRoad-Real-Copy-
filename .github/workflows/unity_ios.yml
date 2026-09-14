@@ -308,6 +308,23 @@ jobs:
           EasyLaunch-Patch/patch.sh "$IOS_BUILD_PATH/iOS"
           echo "::endgroup::"
 
+      - name: Record patched source identity
+        if: github.event.inputs.apply_patch == 'true'
+        run: |
+          python3 EasyLaunch-Patch/Scripts/verify_patch.py \
+            --source-root EasyLaunch-Patch/Sources/Classes \
+            --xcode-root "$IOS_BUILD_PATH/iOS" --commit "$GITHUB_SHA"
+          echo "EasyLaunch source commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Native source hashes are saved in the easylaunch-build-identity artifact.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save patched source identity
+        if: github.event.inputs.apply_patch == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: easylaunch-build-identity
+          path: build/iOS/iOS/easylaunch-build.json
+          if-no-files-found: error
+
       - name: Setup xcode versioning system
         run: |
           ruby <<'RUBY'

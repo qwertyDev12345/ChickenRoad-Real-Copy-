@@ -11,6 +11,7 @@
 @property (nonatomic, copy) NotificationPromptHandler cancelHandler;
 /// Kept so we can resize it on rotation (it lives inside gradView, not self.view.layer directly).
 @property (nonatomic, strong) CAGradientLayer *gradientLayer;
+@property (nonatomic, assign) BOOL handledAction;
 @end
 
 @implementation NotificationPromptViewController
@@ -162,6 +163,9 @@
 
 - (void)onAllow:(id)sender
 {
+    if (self.handledAction) return;
+    self.handledAction = YES;
+    self.allowButton.enabled = self.cancelButton.enabled = NO;
     [self dismissViewControllerAnimated:YES completion:^{
         if (self.allowHandler) self.allowHandler();
     }];
@@ -169,6 +173,9 @@
 
 - (void)onCancel:(id)sender
 {
+    if (self.handledAction) return;
+    self.handledAction = YES;
+    self.allowButton.enabled = self.cancelButton.enabled = NO;
     [self dismissViewControllerAnimated:YES completion:^{
         if (self.cancelHandler) self.cancelHandler();
     }];

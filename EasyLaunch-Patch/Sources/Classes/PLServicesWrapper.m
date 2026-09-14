@@ -56,6 +56,10 @@
 
 - (void)pl_finishWithData:(NSDictionary *)data error:(NSError *)error
 {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self pl_finishWithData:data error:error]; });
+        return;
+    }
     if (self.finished) return;
     self.finished = YES;
 
@@ -142,6 +146,7 @@ static _PLAppsFlyerDelegate *s_afDelegate = nil;
 
 // Key for stored AppsFlyer conversion JSON
 static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_v1";
+static NSData *s_pendingAPNsToken = nil;
 
 // Retrieve stored conversion data (if any)
 + (nullable NSDictionary *)storedAppsFlyerConversionData
@@ -196,6 +201,7 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
     NSString *stored = [[NSUserDefaults standardUserDefaults] stringForKey:@"PLFCMToken"];
     if (stored.length > 0) return stored;
 
+    if (![FIRApp defaultApp]) return nil;
     FIRMessaging *messaging = [FIRMessaging messaging];
     if (messaging) {
         if ([messaging respondsToSelector:@selector(tokenWithCompletion:)]) {
@@ -237,6 +243,10 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
 
 + (void)configureFirebase:(void (^ _Nullable)(NSError * _Nullable))completion
 {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self configureFirebase:completion]; });
+        return;
+    }
 #ifdef PL_HAS_FIREBASE
     // Без @try/@catch (отключены Unity) — сначала проверяем plist
     NSString *plistPath = [[NSBundle mainBundle] pathForResource:@"GoogleService-Info"
@@ -252,39 +262,19 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
         return;
     }
 
-    if ([FIRApp defaultApp] != nil) {
-        NSLog(@"[PLServicesWrapper] Firebase already configured");
-        if (completion) completion(nil);
-        return;
-    }
-
-    [FIRApp configure];
+    if ([FIRApp defaultApp] == nil) [FIRApp configure];
 
     if ([FIRApp defaultApp] != nil) {
         NSLog(@"[PLServicesWrapper] Firebase configured");
 #if __has_include(<FirebaseMessaging/FirebaseMessaging.h>)
-        dispatch_async(dispatch_get_main_queue(), ^{
+        static dispatch_once_t messagingSetup;
+        dispatch_once(&messagingSetup, ^{
             [FIRMessaging messaging].delegate = [_PLMessagingTracker shared];
-
-            // Unity's UnityAppController is the real AppDelegate.
-            // Firebase swizzling does NOT intercept didRegisterForRemoteNotificationsWithDeviceToken
-            // reliably in Unity — Unity posts kUnityDidRegisterForRemoteNotificationsWithDeviceToken
-            // instead. We must forward the APNs device token to Firebase manually.
-            extern NSString* const kUnityDidRegisterForRemoteNotificationsWithDeviceToken;
-            [[NSNotificationCenter defaultCenter]
-                addObserverForName:kUnityDidRegisterForRemoteNotificationsWithDeviceToken
-                            object:nil
-                             queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *note) {
-                NSData *deviceToken = note.userInfo[@"deviceToken"];
-                if ([deviceToken isKindOfClass:[NSData class]] && deviceToken.length > 0) {
-                    NSLog(@"[PLServicesWrapper] Forwarding APNs token to Firebase Messaging");
-                    [FIRMessaging messaging].APNSToken = deviceToken;
-                }
-            }];
-
-            // Trigger APNs registration — Unity will receive the token via the AppDelegate
-            // and post kUnityDidRegisterForRemoteNotificationsWithDeviceToken.
+            if (s_pendingAPNsToken) {
+                [FIRMessaging messaging].APNSToken = s_pendingAPNsToken;
+                s_pendingAPNsToken = nil;
+            }
+            // CustomAppController forwards the typed NSData callback directly.
             [[UIApplication sharedApplication] registerForRemoteNotifications];
         });
 #endif
@@ -302,6 +292,20 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
     NSLog(@"[PLServicesWrapper] Firebase disabled (PL_HAS_FIREBASE not set)");
     if (completion) completion(nil);
 #endif
+}
+
++ (void)setAPNsDeviceToken:(NSData *)deviceToken
+{
+    if (![deviceToken isKindOfClass:NSData.class] || deviceToken.length == 0) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+#if defined(PL_HAS_FIREBASE) && __has_include(<FirebaseMessaging/FirebaseMessaging.h>)
+        if ([FIRApp defaultApp]) {
+            [FIRMessaging messaging].APNSToken = deviceToken;
+        } else {
+            s_pendingAPNsToken = [deviceToken copy];
+        }
+#endif
+    });
 }
 
 + (BOOL)isFirebaseConfigured
