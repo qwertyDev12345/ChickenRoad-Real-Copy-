@@ -13,15 +13,18 @@ The suite compiles the actual CustomAppController, PreloadViewController, Notifi
 
 Coverage: a JavaScript button leading through 50 real HTTP 302s, query/cookie preservation, stale redirect and process recovery after a new push, no POST replay, repeated preload appearance, push replacement during permission completion, completion once only, APNs bytes forwarding, background/memory callbacks before Unity startup, and the missing Unity remote-notification superclass method.
 
+Presentation regressions additionally exercise real UIKit modal dismissal with an inactive permission completion, readiness without a second delegate callback, Settings-return activation after the retry budget, a rejected presentation with no completion, ownership when another window is key, and replacement of a pending push without stale replay. OS activation and the permission response are simulated; these tests do not grant actual system permission.
+
 Device acceptance is still required on the newly built app:
 
 1. Click the redirect button and reach `/final`; verify the skip button and Back.
 2. Tap pushes A then B, in both orders and during loading. Check each clicked payload's URL, also when both pushes share the same URL.
 3. Repeat from foreground, background and a terminated process.
 4. Skip permission, expire the three-day cooldown, allow, then repeat the push checks.
+   Also test a fresh install: Allow and Deny must both continue to WebView. With system permission previously denied, enable it in Settings, return to the app, and verify WebView opens. Capture the interval from the permission response to the visible page.
 5. Switch to Unity mode and repeat background/foreground and push navigation.
 
-Identify the installed source by the launch log `routing revision 2026-09-14-r1` and the build number. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
+Identify the installed source by the launch log `routing revision 2026-09-14-r2` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
 
 These iOS tests have not been executed in the Windows workspace. Local checks must not be reported as a successful device run.
 
@@ -41,6 +44,7 @@ python3 -B -m unittest discover -s EasyLaunch-Patch/Tests -p test_verify_patch.p
 - At 12:50:06, UIKit rejects presentation of WebViewController on a PreloadViewController whose view is not in the window hierarchy (line 8371).
 - At 12:55:43 Cluckstep has PID 1125. At 12:55:45 the scene is invalidated and the process no longer exists (lines 24529, 24573). The recording shows the system crash dialog.
 - The supplied log contains Error/Fault messages, not a symbolicated crash stack or the informational EasyLaunch version marker. It does not establish which exception terminated the application.
-- A fresh `git ls-remote` check found GitHub main at `352ffeeb18c527884cffa45a4507e3fdbf21cda5` (August 31). The September 14 fixes remain uncommitted locally. A workflow run from that remote main cannot include them. The exact Actions run/commit behind build 1 (8) has not been retrieved.
+- At the initial investigation, `git ls-remote` found GitHub main at `352ffeeb18c527884cffa45a4507e3fdbf21cda5` (August 31), before the September 14 fixes were committed. The exact Actions run/commit behind build 1 (8) was not retrieved.
+- Subsequently, the supplied `easylaunch-build.json` identified commit `b52c75d4f0e73a775dcbed25a586242b1df5cc4c` and native fingerprint `3f4ea68a1ed54a903dbffa8b2d13f1fbc527568a9601d54dfb1ce2798c8706d3`. All 14 listed native files matched the local r1 sources. This confirms export identity, not an on-device pass. The r2 presentation changes require a new export and fingerprint.
 
 Before retesting, publish the prepared changes to the intended build branch, run Actions with `apply_patch=true`, and retain the build identity artifact. Real APNs and the three-day permission flow still require a device acceptance run; use the matching `.ips` if the new binary terminates.

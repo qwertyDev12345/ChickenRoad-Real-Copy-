@@ -1,5 +1,6 @@
 #import "CustomAppController.h"
 #import "PreloadViewController.h"
+#import "NotificationPromptViewController.h"
 #import "WebViewController.h"
 #import "WebViewConfig.h"
 #import "EasyLaunchConfig.h"
@@ -36,10 +37,18 @@
 @property (nonatomic, copy, nullable) NSString *coldStartMessageID;
 @property (nonatomic, strong, nullable) NSURL *deferredOpenURL;
 @property (nonatomic, assign) BOOL startingUnity;
+@property (nonatomic, assign) NSUInteger openRequestGeneration;
+@property (nonatomic, assign) NSUInteger openRetryCount;
+@property (nonatomic, assign) BOOL openAttemptScheduled;
+@property (nonatomic, assign) BOOL observingPresentationReadiness;
+@property (nonatomic, weak) WebViewController *openingWebView;
+@property (nonatomic, assign) NSUInteger openingWebViewRequest;
 
 - (void)pl_openURL:(NSURL *)url
-        generation:(NSUInteger)generation
-        retryCount:(NSUInteger)retryCount;
+        generation:(NSUInteger)generation;
+- (void)pl_scheduleOpenAttemptAfter:(NSTimeInterval)delay;
+- (void)pl_drainPendingOpen;
+- (void)pl_presentationMayBeReady:(nullable NSNotification *)notification;
 
 @end
 
@@ -146,7 +155,7 @@
 
     // The push fast path skips preload's SDK chain, but APNs callbacks still arrive.
     [PLServicesWrapper configureFirebase:nil];
-    NSLog(@"[EasyLaunch] routing revision 2026-09-14-r1; build %@",
+    NSLog(@"[EasyLaunch] routing revision 2026-09-14-r2; build %@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
     NSLog(@"[EasyLaunch] source commit=%@ patch_sha256=%@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"] ?: @"unknown",
@@ -200,7 +209,7 @@
 
             } else {
                 // Приложение уже работает (Unity/WebView открыт) — открываем/заменяем сразу.
-                [self pl_openURL:pushURL generation:generation retryCount:0];
+                [self pl_openURL:pushURL generation:generation];
             }
         });
     }
@@ -266,12 +275,11 @@
 
 - (void)pl_openURL:(NSURL *)url
         generation:(NSUInteger)generation
-        retryCount:(NSUInteger)retryCount
 {
     if (!url) return;
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self pl_openURL:url generation:generation retryCount:retryCount];
+            [self pl_openURL:url generation:generation];
         });
         return;
     }
@@ -279,59 +287,114 @@
     // Only the most recently tapped notification is allowed to navigate.
     if (generation != self.pushTapGeneration) return;
     self.deferredOpenURL = url;
-    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive || self.startingUnity) return;
-
-    // Ищем topmost presented view controller и показываем WebView поверх.
-    // Перебираем все windows чтобы найти активный ключевой — используем keyWindow.
-    UIWindow *keyWin = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]] &&
-                scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in scene.windows) {
-                    if (w.isKeyWindow) { keyWin = w; break; }
-                }
-                if (keyWin) break;
-            }
+    self.openRequestGeneration++;
+    self.openRetryCount = 0;
+    if (!self.observingPresentationReadiness) {
+        self.observingPresentationReadiness = YES;
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        [center addObserver:self selector:@selector(pl_presentationMayBeReady:)
+                       name:UIApplicationDidBecomeActiveNotification object:nil];
+        [center addObserver:self selector:@selector(pl_presentationMayBeReady:)
+                       name:UIWindowDidBecomeVisibleNotification object:nil];
+        if (@available(iOS 13.0, *)) {
+            [center addObserver:self selector:@selector(pl_presentationMayBeReady:)
+                           name:UISceneDidActivateNotification object:nil];
         }
     }
-    if (!keyWin) {
-        keyWin = self.preloadWindow ?: self.window;
+    // Permission completion and scene callbacks can precede UIKit readiness.
+    // All retries drain the CURRENT queue; none capture an obsolete push URL.
+    [self pl_scheduleOpenAttemptAfter:0];
+}
+
+- (void)dealloc
+{
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+- (BOOL)pl_isApplicationActive
+{
+    return UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+}
+
+- (UIWindow *)pl_presentationWindow
+{
+    // Our higher-level preload window owns the web flow even if a system/Unity
+    // window temporarily becomes key during permission dismissal.
+    return self.preloadWindow ?: self.window;
+}
+
+- (void)pl_presentationMayBeReady:(NSNotification *)notification
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([notification.name isEqualToString:UIWindowDidBecomeVisibleNotification] &&
+            notification.object != [self pl_presentationWindow]) return;
+        if (!self.deferredOpenURL) return;
+        self.openRetryCount = 0;
+        [self pl_scheduleOpenAttemptAfter:0];
+    });
+}
+
+- (void)pl_scheduleOpenAttemptAfter:(NSTimeInterval)delay
+{
+    if (!self.deferredOpenURL || self.openAttemptScheduled) return;
+    self.openAttemptScheduled = YES;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.openAttemptScheduled = NO;
+        [strongSelf pl_drainPendingOpen];
+    });
+}
+
+- (void)pl_waitForPresentation:(NSString *)reason
+{
+    if (self.openRetryCount == 0)
+        NSLog(@"[EasyLaunch] WebView opening deferred: %@", reason);
+    if (self.openRetryCount++ < 100) {
+        [self pl_scheduleOpenAttemptAfter:0.1];
+    } else if (self.openRetryCount == 101) {
+        // Keep the URL for a later activation/window event (e.g. Settings).
+        NSLog(@"[EasyLaunch] WebView still waiting: %@; destination retained", reason);
+    }
+}
+
+- (void)pl_drainPendingOpen
+{
+    NSURL *url = self.deferredOpenURL;
+    if (!url) return;
+    if (![self pl_isApplicationActive] || self.startingUnity) {
+        [self pl_waitForPresentation:@"application inactive or Unity starting"];
+        return;
+    }
+    UIWindow *keyWin = [self pl_presentationWindow];
+    if (!keyWin || keyWin.hidden || keyWin.alpha <= 0) {
+        [self pl_waitForPresentation:@"owner window not visible"];
+        return;
+    }
+    if (@available(iOS 13.0, *)) {
+        if (keyWin.windowScene &&
+            keyWin.windowScene.activationState != UISceneActivationStateForegroundActive) {
+            [self pl_waitForPresentation:@"owner scene inactive"];
+            return;
+        }
     }
 
     UIViewController *top = keyWin.rootViewController;
     while (top.presentedViewController) {
         top = top.presentedViewController;
     }
-    if (!top || !top.view.window) {
-        // Runtime notification responses can arrive while the scene is being
-        // attached. Retry this exact response; never put it into the cold-start
-        // pending slot, where it could be consumed by a later notification.
-        if (retryCount < 20) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                [self pl_openURL:url generation:generation retryCount:retryCount + 1];
-            });
-        } else {
-            NSLog(@"[CustomAppController] Push UI did not become ready; URL not opened: %@", url);
-        }
+    if (!top || top.viewIfLoaded.window != keyWin) {
+        [self pl_waitForPresentation:@"presenter not attached to owner window"];
         return;
     }
 
-    if (top.isBeingPresented || top.isBeingDismissed || top.transitionCoordinator) {
-        id<UIViewControllerTransitionCoordinator> coordinator = top.transitionCoordinator;
-        if (coordinator) {
-            [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self pl_openURL:url generation:generation retryCount:retryCount + 1];
-                });
-            }];
-        } else if (retryCount < 20) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                [self pl_openURL:url generation:generation retryCount:retryCount + 1];
-            });
-        }
+    if (top.isBeingPresented || top.isBeingDismissed || top.transitionCoordinator ||
+        [top isKindOfClass:NotificationPromptViewController.class]) {
+        // Do not rely solely on a transition completion: UIKit can decline
+        // registration, leaving a one-shot preload completion stranded.
+        [self pl_waitForPresentation:@"permission UI or controller transition"];
         return;
     }
 
@@ -339,8 +402,12 @@
     if ([top isKindOfClass:[WebViewController class]]) {
         // Reuse the existing controller for the URL from this response.
         NSLog(@"[CustomAppController] pl_openURL: navigating existing WebViewController");
-        [(WebViewController *)top navigateToURL:url];
+        if (top != self.openingWebView || self.openingWebViewRequest != self.openRequestGeneration)
+            [(WebViewController *)top navigateToURL:url];
         self.deferredOpenURL = nil;
+        self.openingWebView = nil;
+        self.openRetryCount = 0;
+        NSLog(@"[EasyLaunch] WebView destination delivered in owner window");
         return;
     }
 
@@ -353,8 +420,14 @@
     wvc.onClose = ^{
         [weakSelf dismissPreloadAndStartUnity];
     };
-    [top presentViewController:wvc animated:YES completion:nil];
-    self.deferredOpenURL = nil;
+    self.openingWebView = wvc;
+    self.openingWebViewRequest = self.openRequestGeneration;
+    [top presentViewController:wvc animated:YES completion:^{
+        [weakSelf pl_scheduleOpenAttemptAfter:0];
+    }];
+    // UIKit can reject presentation without invoking completion. Retain the
+    // destination until a visible WebView confirms it; retry independently.
+    [self pl_waitForPresentation:@"waiting for visible WebView"];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -425,12 +498,12 @@
         // Если сервер вернул URL — открыть во встроенном WebView
         vc.onOpenURL = ^(NSURL *url) {
             // Preload and runtime pushes share one serialized presentation path.
-            [weakSelf pl_openURL:url generation:weakSelf.pushTapGeneration retryCount:0];
+            [weakSelf pl_openURL:url generation:weakSelf.pushTapGeneration];
         };
 
         preloadWindow.rootViewController = vc;
-        [preloadWindow makeKeyAndVisible];
         self.preloadWindow = preloadWindow;
+        [preloadWindow makeKeyAndVisible];
     });
 }
 
@@ -483,9 +556,7 @@
             // Теперь инициализируем Unity
             [super initUnityWithScene:self.pendingScene];
             self.startingUnity = NO;
-            if (self.deferredOpenURL) {
-                [self pl_openURL:self.deferredOpenURL generation:self.pushTapGeneration retryCount:0];
-            }
+            [self pl_presentationMayBeReady:nil];
         }];
     });
 }
@@ -496,9 +567,7 @@
 {
     UNUserNotificationCenter.currentNotificationCenter.delegate = self;
     [super applicationDidBecomeActive:application];
-    if (self.deferredOpenURL) {
-        [self pl_openURL:self.deferredOpenURL generation:self.pushTapGeneration retryCount:0];
-    }
+    [self pl_presentationMayBeReady:nil];
 }
 
 // Unity's implementations call native runtime functions unconditionally.

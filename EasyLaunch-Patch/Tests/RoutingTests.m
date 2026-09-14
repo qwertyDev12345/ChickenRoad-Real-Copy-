@@ -3,6 +3,7 @@
 #import <UserNotifications/UserNotifications.h>
 #import "CustomAppController.h"
 #import "PreloadViewController.h"
+#import "NotificationPromptViewController.h"
 #import "WebViewController.h"
 
 extern NSData *PLTestAPNsToken;
@@ -11,6 +12,13 @@ extern NSData *PLTestAPNsToken;
 - (void)application:(UIApplication *)app didReceiveRemoteNotification:(NSDictionary *)info fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completion;
 - (void)application:(UIApplication *)app didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)token;
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completion;
+- (void)pl_openURL:(NSURL *)url generation:(NSUInteger)generation;
+- (BOOL)pl_isApplicationActive;
+- (UIWindow *)pl_presentationWindow;
+- (void)pl_drainPendingOpen;
+@end
+@interface NotificationPromptViewController (TestAccess)
+- (void)onAllow:(id)sender;
 @end
 @interface PreloadViewController (TestAccess)
 - (void)pl_finishWithURL:(NSURL *)url;
@@ -37,6 +45,26 @@ extern NSData *PLTestAPNsToken;
 - (void)pl_step1_checkNetwork { if (self.networkStarted) self.networkStarted(); }
 @end
 
+// Only substitute the OS activation state; presentation/retries use production
+// code and real UIKit windows, controllers and animations.
+@interface RoutingApp : CustomAppController
+@property (nonatomic) BOOL simulatedActive;
+@end
+@implementation RoutingApp
+- (BOOL)pl_isApplicationActive { return self.simulatedActive; }
+@end
+
+@interface RejectOncePresenter : UIViewController
+@property (nonatomic) NSUInteger presentationAttempts;
+@end
+@implementation RejectOncePresenter
+- (void)presentViewController:(UIViewController *)vc animated:(BOOL)animated completion:(void (^)(void))completion {
+    self.presentationAttempts++;
+    if (self.presentationAttempts == 1) return; // UIKit rejection: no completion.
+    [super presentViewController:vc animated:animated completion:completion];
+}
+@end
+
 // Notification responses cannot be publicly constructed. This object supplies
 // their documented read-only properties to the production delegate method.
 @interface TestResponse : NSObject
@@ -53,6 +81,7 @@ extern NSData *PLTestAPNsToken;
 
 @interface RoutingTests : XCTestCase
 @property (nonatomic, strong) UIWindow *testWindow;
+@property (nonatomic, strong) UIWindow *otherWindow;
 @end
 @implementation RoutingTests
 - (void)setUp {
@@ -61,6 +90,9 @@ extern NSData *PLTestAPNsToken;
         [NSUserDefaults.standardUserDefaults removeObjectForKey:key];
 }
 - (void)tearDown {
+    self.otherWindow.hidden = YES;
+    self.otherWindow.rootViewController = nil;
+    self.otherWindow = nil;
     self.testWindow.hidden = YES;
     self.testWindow.rootViewController = nil;
     self.testWindow = nil;
@@ -73,6 +105,122 @@ extern NSData *PLTestAPNsToken;
 }
 - (NSURL *)URL:(NSString *)path {
     return [NSURL URLWithString:[@"http://127.0.0.1:18765" stringByAppendingString:path]];
+}
+- (void)waitUntil:(BOOL (^)(void))condition description:(NSString *)description {
+    NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(id object, NSDictionary *bindings) {
+        return condition();
+    }];
+    XCTNSPredicateExpectation *done = [[XCTNSPredicateExpectation alloc] initWithPredicate:predicate object:nil];
+    XCTAssertEqual([XCTWaiter waitForExpectations:@[done] timeout:5], XCTWaiterResultCompleted, @"%@", description);
+}
+- (void)showRoutingRoot:(UIViewController *)root app:(RoutingApp *)app {
+    self.testWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    self.testWindow.windowLevel = UIWindowLevelNormal + 10;
+    self.testWindow.rootViewController = root;
+    [app setValue:self.testWindow forKey:@"preloadWindow"];
+    [self.testWindow makeKeyAndVisible];
+    [self waitUntil:^BOOL { return root.viewIfLoaded.window != nil; } description:@"root visible"];
+}
+- (WebViewController *)waitForRoutedWebView:(RoutingApp *)app {
+    [self waitUntil:^BOOL {
+        UIViewController *vc = self.testWindow.rootViewController.presentedViewController;
+        return [vc isKindOfClass:WebViewController.class] && vc.viewIfLoaded.window == self.testWindow &&
+            [app valueForKey:@"deferredOpenURL"] == nil;
+    } description:@"queued URL delivered to visible WebView"];
+    return (WebViewController *)self.testWindow.rootViewController.presentedViewController;
+}
+- (void)testPermissionAllowWhileInactiveOpensWithoutAnotherDelegateCallback {
+    RoutingApp *app = [RoutingApp new];
+    PermissionPreload *root = [PermissionPreload new];
+    [self showRoutingRoot:root app:app];
+    __weak RoutingApp *weakApp = app;
+    root.onOpenURL = ^(NSURL *url) { [weakApp pl_openURL:url generation:0]; };
+    [root pl_finishWithURL:[self URL:@"/after-permission"]];
+    [self drainMainQueue];
+    XCTAssertNotNil(root.permissionCompletion);
+    NotificationPromptViewController *prompt = [[NotificationPromptViewController alloc]
+        initWithTitle:@"Allow" message:@"Test" backgroundImage:nil
+        allowHandler:^{ root.permissionCompletion(); } cancelHandler:^{}];
+    prompt.modalPresentationStyle = UIModalPresentationFullScreen;
+    XCTestExpectation *shown = [self expectationWithDescription:@"permission prompt shown"];
+    [root presentViewController:prompt animated:YES completion:^{ [shown fulfill]; }];
+    [self waitForExpectations:@[shown] timeout:5];
+    [prompt onAllow:nil];
+    [self waitUntil:^BOOL { return root.hasFinished; } description:@"allow completed while inactive"];
+    XCTAssertNil(root.presentedViewController);
+    XCTAssertNotNil([app valueForKey:@"deferredOpenURL"]);
+    // Simulate UIKit becoming ready after the earlier lifecycle callback.
+    // Deliberately send no applicationDidBecomeActive: call or notification.
+    app.simulatedActive = YES;
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/after-permission"];
+}
+- (void)testSettingsReturnResumesRetainedDestinationAfterRetryBudget {
+    RoutingApp *app = [RoutingApp new];
+    [self showRoutingRoot:[UIViewController new] app:app];
+    [app pl_openURL:[self URL:@"/after-settings"] generation:0];
+    [self drainMainQueue];
+    [app setValue:@100 forKey:@"openRetryCount"];
+    [app pl_drainPendingOpen];
+    [self waitUntil:^BOOL { return ![[app valueForKey:@"openAttemptScheduled"] boolValue]; }
+        description:@"bounded retry ended"];
+    XCTAssertNotNil([app valueForKey:@"deferredOpenURL"]);
+    app.simulatedActive = YES;
+    [NSNotificationCenter.defaultCenter postNotificationName:UISceneDidActivateNotification object:nil];
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/after-settings"];
+}
+- (void)testRejectedPresentationRetriesInOwnedWindowNotForeignKeyWindow {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    RejectOncePresenter *root = [RejectOncePresenter new];
+    [self showRoutingRoot:root app:app];
+    self.otherWindow = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    self.otherWindow.rootViewController = [UIViewController new];
+    [self.otherWindow makeKeyAndVisible];
+    app.window = self.otherWindow;
+    XCTAssertEqual([app pl_presentationWindow], self.testWindow);
+    [app pl_openURL:[self URL:@"/retry-presentation"] generation:0];
+    [self drainMainQueue];
+    XCTAssertNotNil([app valueForKey:@"deferredOpenURL"]);
+    WebViewController *web = [self waitForRoutedWebView:app];
+    XCTAssertEqual(root.presentationAttempts, 2u);
+    XCTAssertNil(self.otherWindow.rootViewController.presentedViewController);
+    [self waitForWebView:web path:@"/retry-presentation"];
+}
+- (void)testQueuedPushReplacementDoesNotReplayOldURLOnActivation {
+    RoutingApp *app = [RoutingApp new];
+    [self showRoutingRoot:[UIViewController new] app:app];
+    [app pl_openURL:[self URL:@"/push-a"] generation:0];
+    [self drainMainQueue];
+    [app setValue:@1 forKey:@"pushTapGeneration"];
+    [app pl_openURL:[self URL:@"/push-b"] generation:1];
+    [app pl_openURL:[self URL:@"/push-a"] generation:0]; // stale callback
+    app.simulatedActive = YES;
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/push-b"];
+    WKNavigation *navigation = [web valueForKey:@"activeNavigation"];
+    [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidBecomeActiveNotification object:nil];
+    [self drainMainQueue];
+    [self drainMainQueue];
+    XCTAssertEqual(navigation, [web valueForKey:@"activeNavigation"]);
+    XCTAssertNil([app valueForKey:@"deferredOpenURL"]);
+}
+- (void)testNewPushDuringPresentationReusesTheOpeningController {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    UIViewController *root = [UIViewController new];
+    [self showRoutingRoot:root app:app];
+    [app pl_openURL:[self URL:@"/push-a"] generation:0];
+    [self drainMainQueue];
+    UIViewController *opening = root.presentedViewController;
+    XCTAssertTrue([opening isKindOfClass:WebViewController.class]);
+    [app setValue:@1 forKey:@"pushTapGeneration"];
+    [app pl_openURL:[self URL:@"/push-b"] generation:1];
+    WebViewController *web = [self waitForRoutedWebView:app];
+    XCTAssertEqual(web, opening);
+    XCTAssertNil(web.presentedViewController);
+    [self waitForWebView:web path:@"/push-b"];
 }
 - (WebViewController *)showWebView:(NSString *)path {
     WebViewController *vc = [[WebViewController alloc] initWithURL:[self URL:path]];
