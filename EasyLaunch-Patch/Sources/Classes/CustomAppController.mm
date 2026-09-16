@@ -74,49 +74,28 @@
 // MARK: - Push URL helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Извлекает URL из payload push-уведомления.
-/// Ищет поле "url" в: корне payload → data словаре → aps словаре.
+/// Only read navigation fields from THIS response. An explicit click target
+/// takes precedence over a generic URL, including across supported containers.
 + (nullable NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)userInfo
 {
     if (![userInfo isKindOfClass:NSDictionary.class]) return nil;
-
-    // 1. Корень payload: userInfo["url"]
-    NSString *urlStr = userInfo[@"url"];
-    if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
-        urlStr = userInfo[@"click_url"];
-    }
-
-    // 2. FCM data payload: userInfo["data"]["url"]
-    if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
-        NSDictionary *data = userInfo[@"data"];
-        if ([data isKindOfClass:[NSDictionary class]]) {
-            urlStr = data[@"url"];
-            if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
-                urlStr = data[@"click_url"];
-            }
+    NSArray *containers = @[userInfo, userInfo[@"data"] ?: NSNull.null,
+                            userInfo[@"aps"] ?: NSNull.null];
+    for (NSString *key in @[@"click_url", @"url"]) {
+        for (id container in containers) {
+            if (![container isKindOfClass:NSDictionary.class]) continue;
+            id value = [(NSDictionary *)container objectForKey:key];
+            if (![value isKindOfClass:NSString.class]) continue;
+            NSString *text = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (!text.length) continue;
+            NSURL *url = [NSURL URLWithString:text];
+            NSString *scheme = url.scheme.lowercaseString;
+            if (url.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]))
+                return url;
+            // A malformed candidate must not hide another valid field.
         }
     }
-
-    // 3. APS словарь (нестандартное размещение): userInfo["aps"]["url"]
-    if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
-        NSDictionary *aps = userInfo[@"aps"];
-        if ([aps isKindOfClass:[NSDictionary class]]) {
-            urlStr = aps[@"url"];
-            if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) {
-                urlStr = aps[@"click_url"];
-            }
-        }
-    }
-
-    if (![urlStr isKindOfClass:[NSString class]] || urlStr.length == 0) return nil;
-
-    NSURL *url = [NSURL URLWithString:urlStr];
-    NSString *scheme = url.scheme.lowercaseString;
-    if (!url.host.length || (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"])) {
-        NSLog(@"[CustomAppController] Ignoring invalid push URL: %@", urlStr);
-        return nil;
-    }
-    return url;
+    return nil;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +134,7 @@
 
     // The push fast path skips preload's SDK chain, but APNs callbacks still arrive.
     [PLServicesWrapper configureFirebase:nil];
-    NSLog(@"[EasyLaunch] routing revision 2026-09-14-r2; build %@",
+    NSLog(@"[EasyLaunch] routing revision 2026-09-16-r3; build %@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
     NSLog(@"[EasyLaunch] source commit=%@ patch_sha256=%@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"] ?: @"unknown",
@@ -382,8 +361,23 @@
     }
 
     UIViewController *top = keyWin.rootViewController;
+    WebViewController *existingWebView = nil;
+    if ([top isKindOfClass:WebViewController.class]) existingWebView = (WebViewController *)top;
     while (top.presentedViewController) {
         top = top.presentedViewController;
+        if ([top isKindOfClass:WebViewController.class]) existingWebView = (WebViewController *)top;
+    }
+    if (existingWebView && top != existingWebView) {
+        // A camera/file picker or another native modal belongs to the current
+        // document. Never cover it with a second WebView or replace its page
+        // before its completion has returned the selected file. Picking can
+        // take longer than the normal transition retry budget; wait at a low
+        // rate while foregrounded. Background retries remain bounded above.
+        if (self.openRetryCount == 0)
+            NSLog(@"[EasyLaunch] Push navigation waiting for WebView modal to close");
+        self.openRetryCount++;
+        [self pl_scheduleOpenAttemptAfter:0.5];
+        return;
     }
     if (!top || top.viewIfLoaded.window != keyWin) {
         [self pl_waitForPresentation:@"presenter not attached to owner window"];

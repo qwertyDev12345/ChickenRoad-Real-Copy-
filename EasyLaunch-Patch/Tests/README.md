@@ -15,6 +15,8 @@ Coverage: a JavaScript button leading through 50 real HTTP 302s, query/cookie pr
 
 Presentation regressions additionally exercise real UIKit modal dismissal with an inactive permission completion, readiness without a second delegate callback, Settings-return activation after the retry budget, a rejected presentation with no completion, ownership when another window is key, and replacement of a pending push without stale replay. OS activation and the permission response are simulated; these tests do not grant actual system permission.
 
+The r3 regressions check explicit `click_url` precedence (root, then data, then aps), fallback to a valid `url` (same container order), whitespace, invalid values and image-only payloads. They also cover a push arriving during a full-screen native modal, selection exceeding the usual retry budget, latest-push replacement, and no document reload on return without a push. The modal is a UIKit stand-in, NOT an actual camera: successful image delivery to an HTML file input still requires an iPhone check. The actual 777 payload has not been supplied, so the parser change is not proof of the cause in the recording.
+
 Device acceptance is still required on the newly built app:
 
 1. Click the redirect button and reach `/final`; verify the skip button and Back.
@@ -23,8 +25,9 @@ Device acceptance is still required on the newly built app:
 4. Skip permission, expire the three-day cooldown, allow, then repeat the push checks.
    Also test a fresh install: Allow and Deny must both continue to WebView. With system permission previously denied, enable it in Settings, return to the app, and verify WebView opens. Capture the interval from the permission response to the visible page.
 5. Switch to Unity mode and repeat background/foreground and push navigation.
+6. On the file test, choose a camera image on the first attempt, cancel and retry, and choose an ordinary file. Repeat with a push received/tapped while a native picker is open. Verify no second WebView covers the picker; after it closes the latest requested destination should open in the original WebView.
 
-Identify the installed source by the launch log `routing revision 2026-09-14-r2` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
+Identify the installed source by the launch log `routing revision 2026-09-16-r3` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
 
 These iOS tests have not been executed in the Windows workspace. Local checks must not be reported as a successful device run.
 

@@ -106,6 +106,37 @@ extern NSData *PLTestAPNsToken;
 - (NSURL *)URL:(NSString *)path {
     return [NSURL URLWithString:[@"http://127.0.0.1:18765" stringByAppendingString:path]];
 }
+- (void)testExplicitClickURLWinsOverGenericURL {
+    NSDictionary *payload = @{@"url": [self URL:@"/generic"].absoluteString,
+        @"click_url": [self URL:@"/clicked"].absoluteString};
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:payload].path, @"/clicked");
+    NSDictionary *nested = @{@"url": [self URL:@"/generic"].absoluteString,
+        @"data": @{@"click_url": [self URL:@"/nested-click"].absoluteString}};
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:nested].path, @"/nested-click");
+}
+- (void)testInvalidCandidateDoesNotHideValidPayloadURL {
+    NSDictionary *payload = @{@"click_url": @"javascript:alert(1)", @"url": @"not a URL",
+        @"data": @{@"url": [self URL:@"/valid-fallback"].absoluteString}};
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:payload].path, @"/valid-fallback");
+    NSDictionary *invalidGeneric = @{@"url": @"invalid", @"click_url": [self URL:@"/clicked"].absoluteString};
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:invalidGeneric].path, @"/clicked");
+}
+- (void)testPushParserAcceptsLegacyURLAndTrimsWhitespace {
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:
+        @{@"aps": @{@"url": [self URL:@"/legacy"].absoluteString}}].path, @"/legacy");
+    NSString *padded = [NSString stringWithFormat:@" \n%@\n ", [self URL:@"/trimmed"].absoluteString];
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:@{@"click_url": padded}].path, @"/trimmed");
+}
+- (void)testPushParserNeverUsesImageOrPreviousResponse {
+    XCTAssertNotNil([CustomAppController pl_pushURLFromUserInfo:@{@"url": [self URL:@"/first"].absoluteString}]);
+    NSDictionary *imageOnly = @{@"image_url": [self URL:@"/image.jpg"].absoluteString,
+        @"data": @42, @"aps": NSNull.null};
+    NSDictionary *invalidValues = @{@"url": @42, @"click_url": @"file:///private/file",
+        @"data": @{@"url": NSNull.null}};
+    XCTAssertNil([CustomAppController pl_pushURLFromUserInfo:imageOnly]);
+    XCTAssertNil([CustomAppController pl_pushURLFromUserInfo:invalidValues]);
+    XCTAssertNil([CustomAppController pl_pushURLFromUserInfo:(id)@[]]);
+}
 - (void)waitUntil:(BOOL (^)(void))condition description:(NSString *)description {
     NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(id object, NSDictionary *bindings) {
         return condition();
@@ -221,6 +252,59 @@ extern NSData *PLTestAPNsToken;
     XCTAssertEqual(web, opening);
     XCTAssertNil(web.presentedViewController);
     [self waitForWebView:web path:@"/push-b"];
+}
+- (void)testPushWaitsForFilePickerAndReusesOriginalWebViewAfterLongSelection {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    UIViewController *root = [UIViewController new];
+    [self showRoutingRoot:root app:app];
+    [app pl_openURL:[self URL:@"/form"] generation:0];
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/form"];
+    WKNavigation *originalNavigation = [web valueForKey:@"activeNavigation"];
+    // Simulator-independent substitute for the native camera/file picker.
+    // It uses real full-screen UIKit presentation but does not take a photo.
+    UIViewController *picker = [UIViewController new];
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    XCTestExpectation *shown = [self expectationWithDescription:@"native picker presented"];
+    [web presentViewController:picker animated:YES completion:^{ [shown fulfill]; }];
+    [self waitForExpectations:@[shown] timeout:5];
+    [app pl_openURL:[self URL:@"/push-a"] generation:0];
+    [app setValue:@101 forKey:@"openRetryCount"]; // selection outlasted normal retry budget
+    [self drainMainQueue];
+    XCTAssertNil(picker.presentedViewController);
+    XCTAssertEqual([web valueForKey:@"activeNavigation"], originalNavigation);
+    XCTAssertTrue([[app valueForKey:@"openAttemptScheduled"] boolValue]);
+    [app setValue:@1 forKey:@"pushTapGeneration"];
+    [app pl_openURL:[self URL:@"/push-b"] generation:1];
+    XCTestExpectation *closed = [self expectationWithDescription:@"picker returned"];
+    [picker dismissViewControllerAnimated:YES completion:^{ [closed fulfill]; }];
+    [self waitForExpectations:@[closed] timeout:5];
+    XCTAssertEqual([self waitForRoutedWebView:app], web);
+    XCTAssertNil(web.presentedViewController);
+    [self waitForWebView:web path:@"/push-b"];
+}
+- (void)testReturningFromNativeModalWithoutPushDoesNotReloadDocument {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    [self showRoutingRoot:[UIViewController new] app:app];
+    [app pl_openURL:[self URL:@"/form"] generation:0];
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/form"];
+    WKNavigation *originalNavigation = [web valueForKey:@"activeNavigation"];
+    UIViewController *picker = [UIViewController new];
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    XCTestExpectation *shown = [self expectationWithDescription:@"picker shown without push"];
+    [web presentViewController:picker animated:YES completion:^{ [shown fulfill]; }];
+    [self waitForExpectations:@[shown] timeout:5];
+    [app applicationDidBecomeActive:UIApplication.sharedApplication];
+    XCTestExpectation *closed = [self expectationWithDescription:@"picker dismissed without push"];
+    [picker dismissViewControllerAnimated:YES completion:^{ [closed fulfill]; }];
+    [self waitForExpectations:@[closed] timeout:5];
+    [self drainMainQueue];
+    XCTAssertEqual([web valueForKey:@"activeNavigation"], originalNavigation);
+    XCTAssertEqual(self.testWindow.rootViewController.presentedViewController, web);
+    XCTAssertNil([app valueForKey:@"deferredOpenURL"]);
 }
 - (WebViewController *)showWebView:(NSString *)path {
     WebViewController *vc = [[WebViewController alloc] initWithURL:[self URL:path]];
