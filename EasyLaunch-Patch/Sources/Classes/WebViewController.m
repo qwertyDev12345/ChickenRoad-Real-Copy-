@@ -71,7 +71,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
 @property (nonatomic, assign) BOOL displayingLoadError;
 @property (nonatomic, assign) NSUInteger loadStatusGeneration;
 @property (nonatomic, strong) UITextView *diagnosticTextView;
-@property (nonatomic, strong) UIButton *copyDiagnosticButton;
+@property (nonatomic, strong) UIButton *diagnosticCopyButton;
 @property (nonatomic, copy) NSString *diagnosticReport;
 @property (nonatomic, strong) NSMutableArray<NSString *> *diagnosticEvents;
 @property (nonatomic, strong) NSURL *diagnosticRouteURL;
@@ -300,7 +300,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     if (!self.diagnosticReport.length || !self.displayingLoadError) return;
     // Only an explicit tap writes the clipboard; never copy the raw error/URL.
     UIPasteboard.generalPasteboard.string = self.diagnosticReport;
-    [self.copyDiagnosticButton setTitle:@"Copied — send this report" forState:UIControlStateNormal];
+    [self.diagnosticCopyButton setTitle:@"Copied — send this report" forState:UIControlStateNormal];
 }
 
 - (void)pl_setupLoadStatus
@@ -330,12 +330,12 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.diagnosticTextView.backgroundColor = [UIColor colorWithWhite:0.10 alpha:1];
     self.diagnosticTextView.accessibilityIdentifier = @"web-diagnostic-report";
     self.diagnosticTextView.hidden = YES;
-    self.copyDiagnosticButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.copyDiagnosticButton setTitle:@"Copy diagnostics" forState:UIControlStateNormal];
-    [self.copyDiagnosticButton addTarget:self action:@selector(pl_copyDiagnostics) forControlEvents:UIControlEventTouchUpInside];
-    self.copyDiagnosticButton.accessibilityIdentifier = @"web-copy-diagnostics";
-    self.copyDiagnosticButton.hidden = YES;
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.loadSpinner, self.loadStatusLabel, self.diagnosticTextView, self.copyDiagnosticButton, self.retryButton]];
+    self.diagnosticCopyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.diagnosticCopyButton setTitle:@"Copy diagnostics" forState:UIControlStateNormal];
+    [self.diagnosticCopyButton addTarget:self action:@selector(pl_copyDiagnostics) forControlEvents:UIControlEventTouchUpInside];
+    self.diagnosticCopyButton.accessibilityIdentifier = @"web-copy-diagnostics";
+    self.diagnosticCopyButton.hidden = YES;
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.loadSpinner, self.loadStatusLabel, self.diagnosticTextView, self.diagnosticCopyButton, self.retryButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -393,7 +393,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.loadStatusLabel.text = @"Loading…";
     self.retryButton.hidden = YES;
     self.diagnosticTextView.hidden = YES;
-    self.copyDiagnosticButton.hidden = YES;
+    self.diagnosticCopyButton.hidden = YES;
     NSUInteger statusGeneration = ++self.loadStatusGeneration;
     // A cancelled/never-committed first navigation must not leave a blank screen.
     // This is a UI deadline, not an automatic reload or a TLS/ATS bypass.
@@ -426,8 +426,8 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.diagnosticTextView.text = self.diagnosticReport;
     [self.diagnosticTextView setContentOffset:CGPointZero animated:NO];
     self.diagnosticTextView.hidden = NO;
-    self.copyDiagnosticButton.hidden = NO;
-    [self.copyDiagnosticButton setTitle:@"Copy diagnostics" forState:UIControlStateNormal];
+    self.diagnosticCopyButton.hidden = NO;
+    [self.diagnosticCopyButton setTitle:@"Copy diagnostics" forState:UIControlStateNormal];
     self.navigationGeneration++; // Invalidate any queued redirect/process recovery.
     self.loadStatusGeneration++;
     self.displayingLoadError = YES;

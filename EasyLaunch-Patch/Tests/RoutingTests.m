@@ -705,7 +705,7 @@ extern NSData *PLTestAPNsToken;
     XCTAssertEqualObjects(UIPasteboard.generalPasteboard.string, uiReport);
     [vc navigateToURL:[self URL:@"/new-push"]];
     XCTAssertTrue(text.hidden);
-    XCTAssertTrue([[vc valueForKey:@"copyDiagnosticButton"] isHidden]);
+    XCTAssertTrue([[vc valueForKey:@"diagnosticCopyButton"] isHidden]);
     XCTAssertNil([vc valueForKey:@"diagnosticReport"]);
     WKWebView *web = [vc valueForKey:@"webView"];
     [web stopLoading];
