@@ -14,6 +14,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Вызывается при закрытии контроллера (напр., чтобы продолжить запуск Unity)
 @property (nonatomic, copy, nullable) void (^onClose)(void);
+/// App-owned, non-sensitive routing flags for the on-screen diagnostic report.
+@property (nonatomic, copy, nullable) NSString *diagnosticContext;
 
 /// Opens a new URL in the existing web view. Safe to call before viewDidLoad.
 - (void)navigateToURL:(NSURL *)url;

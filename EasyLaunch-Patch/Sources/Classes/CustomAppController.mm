@@ -36,6 +36,9 @@
 @property (nonatomic, strong, nullable) NSURL *coldStartPushURL;
 @property (nonatomic, copy, nullable) NSString *coldStartMessageID;
 @property (nonatomic, strong, nullable) NSURL *deferredOpenURL;
+@property (nonatomic, strong, nullable) NSURL *diagnosticLastPushURL;
+@property (nonatomic, copy) NSString *deferredDiagnosticContext;
+@property (nonatomic, copy) NSString *diagnosticPushEntry;
 @property (nonatomic, assign) BOOL startingUnity;
 @property (nonatomic, assign) NSUInteger openRequestGeneration;
 @property (nonatomic, assign) NSUInteger openRetryCount;
@@ -110,6 +113,8 @@
     if (remoteNotif) {
         self.pendingPushURL = [CustomAppController pl_pushURLFromUserInfo:remoteNotif];
         self.coldStartPushURL = self.pendingPushURL;
+        self.diagnosticLastPushURL = self.pendingPushURL;
+        self.diagnosticPushEntry = @"launchOptions";
         id messageID = remoteNotif[@"gcm.message_id"] ?: remoteNotif[@"google.message_id"];
         self.coldStartMessageID = [messageID isKindOfClass:NSString.class] ? messageID : nil;
         NSURL *capturedColdURL = self.coldStartPushURL;
@@ -134,7 +139,7 @@
 
     // The push fast path skips preload's SDK chain, but APNs callbacks still arrive.
     [PLServicesWrapper configureFirebase:nil];
-    NSLog(@"[EasyLaunch] routing revision 2026-09-17-r4; build %@",
+    NSLog(@"[EasyLaunch] routing revision 2026-09-17-r5-diag; build %@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
     NSLog(@"[EasyLaunch] source commit=%@ patch_sha256=%@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"] ?: @"unknown",
@@ -171,6 +176,9 @@
             }
             NSLog(@"[CustomAppController] Push tap URL: %@", pushURL);
             NSUInteger generation = ++self.pushTapGeneration;
+            self.diagnosticLastPushURL = pushURL;
+            self.diagnosticPushEntry = self.preloadWindow == nil && self.engineLoadState < kUnityEngineLoadStateCoreInitialized ?
+                @"response before preload window" : @"notification response with existing window/engine";
             PreloadViewController *preloadVC =
                 (PreloadViewController *)self.preloadWindow.rootViewController;
 
@@ -265,6 +273,10 @@
     // Only the most recently tapped notification is allowed to navigate.
     if (generation != self.pushTapGeneration) return;
     self.deferredOpenURL = url;
+    self.deferredDiagnosticContext = [NSString stringWithFormat:@"tap=%lu; equals last push=%@; entry=%@; engine=%ld; preload=%@; Unity starting=%@",
+        (unsigned long)generation, [url isEqual:self.diagnosticLastPushURL] ? @"yes" : @"no/unknown",
+        self.diagnosticPushEntry ?: @"no push observed", (long)self.engineLoadState,
+        self.preloadInProgress ? @"yes" : @"no", self.startingUnity ? @"yes" : @"no"];
     self.openRequestGeneration++;
     self.openRetryCount = 0;
     if (!self.observingPresentationReadiness) {
@@ -393,6 +405,7 @@
 
     // Если WebViewController уже открыт — загружаем URL именно текущего tap.
     if ([top isKindOfClass:[WebViewController class]]) {
+        ((WebViewController *)top).diagnosticContext = self.deferredDiagnosticContext;
         // Reuse the existing controller for the URL from this response.
         NSLog(@"[CustomAppController] pl_openURL: navigating existing WebViewController");
         if (top != self.openingWebView || self.openingWebViewRequest != self.openRequestGeneration)
@@ -405,6 +418,7 @@
     }
 
     WebViewController *wvc = [[WebViewController alloc] initWithURL:url];
+    wvc.diagnosticContext = self.deferredDiagnosticContext;
     wvc.modalPresentationStyle = UIModalPresentationFullScreen;
     if (@available(iOS 13.0, *)) {
         wvc.modalInPresentation = YES;

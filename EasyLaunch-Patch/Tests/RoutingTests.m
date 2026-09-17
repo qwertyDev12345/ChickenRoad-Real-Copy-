@@ -33,6 +33,18 @@ extern NSData *PLTestAPNsToken;
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation;
 - (void)pl_retryLoading;
 - (void)pl_loadingDeadlineExpired:(NSUInteger)generation;
+- (NSString *)pl_diagnosticReportForError:(NSError *)error source:(NSString *)source;
+- (void)pl_recordDiagnostic:(NSString *)event URL:(NSURL *)url;
+- (void)pl_copyDiagnostics;
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationResponse:(WKNavigationResponse *)response decisionHandler:(void (^)(WKNavigationResponsePolicy))handler;
+@end
+
+@interface TestNavigationResponse : NSObject
+@property (nonatomic, strong) NSURLResponse *response;
+@property (nonatomic, getter=isForMainFrame) BOOL forMainFrame;
+@property (nonatomic) BOOL canShowMIMEType;
+@end
+@implementation TestNavigationResponse
 @end
 
 // Intercepts only the OS permission dialog/network entry; the production
@@ -635,5 +647,98 @@ extern NSData *PLTestAPNsToken;
     [self waitForExpectations:@[delay] timeout:3];
     XCTAssertEqual(navigation, [vc valueForKey:@"activeNavigation"]);
     XCTAssertTrue([[vc valueForKey:@"displayingLoadError"] boolValue]);
+}
+- (void)testDiagnosticReportRedactsURLsAndErrorDescriptions {
+    NSURL *secretURL = [NSURL URLWithString:@"https://private-user:private-password@example.com/push/token/path-secret?token=query-secret&next=https%3A%2F%2Fsecret.example#fragment-secret"];
+    WebViewController *vc = [[WebViewController alloc] initWithURL:secretURL];
+    NSError *underlying = [NSError errorWithDomain:@"kCFErrorDomainCFNetwork" code:-1001 userInfo:nil];
+    NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:-1001 userInfo:@{
+        NSURLErrorFailingURLErrorKey: secretURL, NSUnderlyingErrorKey: underlying,
+        NSLocalizedDescriptionKey: @"private-description", @"private-payload": @"private-value"}];
+    NSString *report = [vc pl_diagnosticReportForError:error source:@"test failure"];
+    for (NSString *secret in @[@"private-user", @"private-password", @"path-secret", @"query-secret", @"secret.example", @"fragment-secret", @"private-description", @"private-value"])
+        XCTAssertFalse([report containsString:secret], @"Leaked %@", secret);
+    XCTAssertTrue([report containsString:@"https://example.com/push/token/<hidden>?token=<hidden>&next=<hidden>"]);
+    XCTAssertTrue([report containsString:@"NSURLErrorDomain -1001 <- kCFErrorDomainCFNetwork -1001"]);
+    XCTAssertTrue([report containsString:@"[id="]);
+}
+- (void)testDiagnosticIdentityDistinguishesHiddenQueryValues {
+    NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:-1001 userInfo:nil];
+    WebViewController *first = [[WebViewController alloc] initWithURL:[NSURL URLWithString:@"https://example.com/push?token=first-secret"]];
+    NSString *a = [first pl_diagnosticReportForError:error source:@"test"];
+    NSString *b = [first pl_diagnosticReportForError:error source:@"test"];
+    WebViewController *second = [[WebViewController alloc] initWithURL:[NSURL URLWithString:@"https://example.com/push?token=second-secret"]];
+    NSString *c = [second pl_diagnosticReportForError:error source:@"test"];
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"id=([a-f0-9]{12})" options:0 error:nil];
+    NSString *(^identity)(NSString *) = ^NSString *(NSString *text) {
+        NSTextCheckingResult *match = [regex firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+        return match ? [text substringWithRange:[match rangeAtIndex:1]] : nil;
+    };
+    XCTAssertNotNil(identity(a));
+    XCTAssertEqualObjects(identity(a), identity(b));
+    XCTAssertNotEqualObjects(identity(a), identity(c));
+    XCTAssertFalse([a containsString:@"first-secret"]);
+    XCTAssertFalse([c containsString:@"second-secret"]);
+}
+- (void)testDiagnosticTimelineIsBoundedAndNewRouteClearsOldData {
+    WebViewController *vc = [[WebViewController alloc] initWithURL:[self URL:@"/old-push"]];
+    for (NSUInteger i = 0; i < 75; i++) [vc pl_recordDiagnostic:[NSString stringWithFormat:@"event-%lu", (unsigned long)i] URL:nil];
+    XCTAssertEqual([[vc valueForKey:@"diagnosticEvents"] count], 40u);
+    [vc navigateToURL:[self URL:@"/777"]]; // does not load a view or send a request
+    NSString *report = [vc pl_diagnosticReportForError:[NSError errorWithDomain:NSURLErrorDomain code:-1001 userInfo:nil] source:@"test"];
+    XCTAssertFalse([report containsString:@"old-push"]);
+    XCTAssertFalse([report containsString:@"event-74"]);
+    XCTAssertTrue([report containsString:@"/777"]);
+    XCTAssertFalse(vc.isViewLoaded);
+}
+- (void)testDiagnosticScreenDistinguishesUIAndWebKitTimeoutAndCopiesSnapshot {
+    WebViewController *vc = [self showWebView:@"/777"];
+    [vc pl_loadingDeadlineExpired:[[vc valueForKey:@"loadStatusGeneration"] unsignedIntegerValue]];
+    NSString *uiReport = [vc valueForKey:@"diagnosticReport"];
+    XCTAssertTrue([uiReport containsString:@"Source: app UI deadline"]);
+    UITextView *text = [vc valueForKey:@"diagnosticTextView"];
+    XCTAssertFalse(text.hidden);
+    XCTAssertFalse(text.editable);
+    XCTAssertTrue(text.selectable);
+    XCTAssertEqualObjects(text.text, uiReport);
+    [vc pl_copyDiagnostics];
+    XCTAssertEqualObjects(UIPasteboard.generalPasteboard.string, uiReport);
+    [vc navigateToURL:[self URL:@"/new-push"]];
+    XCTAssertTrue(text.hidden);
+    XCTAssertTrue([[vc valueForKey:@"copyDiagnosticButton"] isHidden]);
+    XCTAssertNil([vc valueForKey:@"diagnosticReport"]);
+    WKWebView *web = [vc valueForKey:@"webView"];
+    [web stopLoading];
+    [vc webView:web didFailProvisionalNavigation:[vc valueForKey:@"activeNavigation"]
+        withError:[NSError errorWithDomain:NSURLErrorDomain code:-1001 userInfo:nil]];
+    NSString *networkReport = [vc valueForKey:@"diagnosticReport"];
+    XCTAssertTrue([networkReport containsString:@"Source: WebKit didFailProvisionalNavigation"]);
+    // WebView.URL may legitimately still describe the previously displayed
+    // page; retain that evidence, but never retain its route/timeline as current.
+    XCTAssertEqualObjects([[vc valueForKey:@"diagnosticRouteURL"] path], @"/new-push");
+    XCTAssertFalse([[[vc valueForKey:@"diagnosticEvents"] componentsJoinedByString:@"\n"] containsString:@"/777"]);
+    XCTAssertTrue([networkReport containsString:@"/new-push"]);
+    [vc pl_copyDiagnostics];
+    XCTAssertEqualObjects(UIPasteboard.generalPasteboard.string, networkReport);
+}
+- (void)testDiagnosticResponseObservationPreservesDefaultMIMEPolicy {
+    WebViewController *vc = [[WebViewController alloc] initWithURL:[self URL:@"/777"]];
+    TestNavigationResponse *response = [TestNavigationResponse new];
+    response.forMainFrame = YES;
+    response.canShowMIMEType = YES;
+    response.response = [[NSHTTPURLResponse alloc] initWithURL:[self URL:@"/final?token=hidden-response-token"] statusCode:503 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"text/html", @"Set-Cookie": @"private-cookie"}];
+    __block NSUInteger decisions = 0;
+    [vc webView:nil decidePolicyForNavigationResponse:(id)response decisionHandler:^(WKNavigationResponsePolicy policy) {
+        decisions++; XCTAssertEqual(policy, WKNavigationResponsePolicyAllow);
+    }];
+    XCTAssertTrue([[vc valueForKey:@"diagnosticLastResponse"] containsString:@"HTTP 503"]);
+    response.canShowMIMEType = NO;
+    [vc webView:nil decidePolicyForNavigationResponse:(id)response decisionHandler:^(WKNavigationResponsePolicy policy) {
+        decisions++; XCTAssertEqual(policy, WKNavigationResponsePolicyCancel);
+    }];
+    XCTAssertEqual(decisions, 2u);
+    NSString *report = [vc pl_diagnosticReportForError:[NSError errorWithDomain:NSURLErrorDomain code:-1001 userInfo:nil] source:@"test"];
+    XCTAssertFalse([report containsString:@"private-cookie"]);
+    XCTAssertFalse([report containsString:@"hidden-response-token"]);
 }
 @end

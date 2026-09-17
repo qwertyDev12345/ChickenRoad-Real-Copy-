@@ -30,7 +30,22 @@ Device acceptance is still required on the newly built app:
 
 The r4 regressions cover notification responses before Unity/preload entry, latest early push transfer, interruption of config checks, stale startup callbacks, a push during the Unity fade, a real dropped first-load connection, same-target retry, stale failure/finish events, loading deadline ownership and POST/process-recovery safety. Permission completion ordering and the older redirect/modal regressions remain in the suite. The 45-second no-commit UI deadline is tested by invoking its production handler, not by waiting 45 seconds. This is not evidence that a valid page's own JavaScript cannot render black after content commits.
 
-Identify the installed source by the launch log `routing revision 2026-09-17-r4` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. Load errors now show their domain/code on screen. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
+Identify the installed source by the launch log `routing revision 2026-09-17-r5-diag` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
+
+## On-screen diagnostic capture (r5)
+
+This revision adds observation, NOT a confirmed fix for the production 777 timeout. It does not increase timeouts, clear cookies/storage, bypass TLS, request notification permission, or send diagnostic probes. The navigation-response observer preserves WebKit's default allow-if-displayable MIME policy.
+
+1. Update to a build containing r5 with `apply_patch=true`; do not reinstall/clear app data just to gather evidence.
+2. Close the app and tap 777. On failure, the report must start with `EASYLAUNCH DIAG r5`.
+3. Tap **Copy diagnostics** and send the entire text. Alternatively scroll the diagnostic panel and capture all parts. Copy BEFORE pressing Try again; then optionally send the retry's report too.
+4. Label whether permission was allowed immediately or after Skip + the three-day cooldown, and whether this was a cold launch. Capture each failing scenario separately.
+
+The report includes the native-vs-UI error source, nested error domain/codes, last stage, elapsed time, observed load/redirect counts, original route URL, current request, last redirect, WebView URL and error URL; app/scene visibility, HTTP response/MIME when observed, permission status, saved skip age (if still stored), build/commit/fingerprint and the last 40 callback events. `not observed` is not proof that the server received no request. The timeline is bounded and is not a packet trace; TLS/DNS timings and HTTP redirect response codes are not available here. URLs/identities can confirm replacement by another address, but do not expose hidden query values for replay.
+
+Privacy: only allowlisted diagnostic fields are collected locally in memory. No automatic upload. Copy writes the report only after an explicit tap. URL credentials, ALL query values, fragments, non-HTTP URL contents and selected sensitive/long path segments are hidden; a short SHA-256 URL identity allows comparison even when query values differ. Hostnames and ordinary path segments remain visible and must be reviewed before sharing. NSError descriptions/userInfo dumps, cookies, headers, bodies, tokens and notification payloads are not included. The frozen report is replaced on the next error, and a new route clears the previous timeline/report.
+
+The added native tests cover URL/description redaction, identity comparison, bounded/reset timelines, UI-vs-WebKit timeout distinction, report copying and response-policy preservation. These are still unexecuted in this Windows workspace; the Mac Actions gate must compile/run them. Check the scroll/copy UI on a small iPhone in portrait and landscape during device acceptance.
 
 These iOS tests have not been executed in the Windows workspace. Local checks must not be reported as a successful device run.
 
