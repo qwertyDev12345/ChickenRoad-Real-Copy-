@@ -7,6 +7,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlsplit(self.path)
         query = f"?{url.query}" if url.query else ""
+        if url.path == "/disconnect":
+            # Close without response headers: a real first-load WebKit failure.
+            self.close_connection = True
+            return
         if url.path.startswith("/redirect/"):
             hop = int(url.path.rsplit("/", 1)[1])
             target = f"/redirect/{hop + 1}" if hop < 50 else "/final"

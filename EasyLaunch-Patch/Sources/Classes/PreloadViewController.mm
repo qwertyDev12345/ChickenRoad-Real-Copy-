@@ -148,6 +148,16 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
 // ── Public ─────────────────────────────────────────────────────────────────────
 
+- (void)acceptPushURL:(NSURL *)url
+{
+    NSAssert(NSThread.isMainThread, @"Push routing must run on main");
+    if (self.hasFinished || !url) return;
+    self.pendingPushURL = url;
+    // Do not wait for attribution/config (or an offline config endpoint).
+    // Once the permission flow owns completion, preserve its dismissal ordering.
+    if (!self.finishRequested) [self pl_completeWithURL:url];
+}
+
 - (void)startChecks
 {
     if (![NSThread isMainThread]) {

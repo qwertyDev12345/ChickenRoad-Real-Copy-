@@ -134,7 +134,7 @@
 
     // The push fast path skips preload's SDK chain, but APNs callbacks still arrive.
     [PLServicesWrapper configureFirebase:nil];
-    NSLog(@"[EasyLaunch] routing revision 2026-09-16-r3; build %@",
+    NSLog(@"[EasyLaunch] routing revision 2026-09-17-r4; build %@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
     NSLog(@"[EasyLaunch] source commit=%@ patch_sha256=%@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"] ?: @"unknown",
@@ -176,14 +176,13 @@
 
             if ([preloadVC isKindOfClass:[PreloadViewController class]]
                 && !preloadVC.hasFinished) {
-                // Preload-экран активен и ещё не открыл WebView:
-                // передаём URL — startChecks или pl_finishWithURL его подхватят.
-                // Покрывает cold start + случай когда launchOptions не содержал URL.
-                preloadVC.pendingPushURL = pushURL;
+                preloadVC.routingGeneration = generation;
+                [preloadVC acceptPushURL:pushURL];
 
-            } else if (self.preloadInProgress && self.preloadWindow == nil) {
-                // Preload запускается, но окно ещё не создано (очень ранний cold start):
-                // сохраняем — showPreloadScreenForScene передаст в VC.
+            } else if (!self.unityMode && !self.startingUnity && self.preloadWindow == nil &&
+                       self.engineLoadState < kUnityEngineLoadStateCoreInitialized) {
+                // Includes the response BEFORE initUnityWithScene sets preloadInProgress.
+                // Never queue an independent runtime open alongside a future config run.
                 self.pendingPushURL = pushURL;
 
             } else {
@@ -476,6 +475,7 @@
                                                       appleAppId:EL_APPLE_APP_ID
                                                      endpointURL:EL_ENDPOINT_URL];
         vc.config = cfg;
+        vc.routingGeneration = self.pushTapGeneration;
 
         // Если приложение открыто через push с URL — передаём его напрямую
         if (self.pendingPushURL) {
@@ -485,14 +485,22 @@
 
         // По завершении всех проверок — скрываем preload и запускаем Unity
         __weak typeof(self) weakSelf = self;
+        __weak PreloadViewController *weakPreload = vc;
         vc.onComplete = ^{
-            [weakSelf dismissPreloadAndStartUnity];
+            __strong typeof(weakSelf) app = weakSelf;
+            PreloadViewController *preload = weakPreload;
+            if (!app || !preload || app.preloadWindow.rootViewController != preload ||
+                preload.routingGeneration != app.pushTapGeneration) return;
+            [app dismissPreloadAndStartUnity];
         };
 
         // Если сервер вернул URL — открыть во встроенном WebView
         vc.onOpenURL = ^(NSURL *url) {
-            // Preload and runtime pushes share one serialized presentation path.
-            [weakSelf pl_openURL:url generation:weakSelf.pushTapGeneration];
+            __strong typeof(weakSelf) app = weakSelf;
+            PreloadViewController *preload = weakPreload;
+            if (!app || !preload || app.preloadWindow.rootViewController != preload) return;
+            // Never relabel an old startup callback with the CURRENT push token.
+            [app pl_openURL:url generation:preload.routingGeneration];
         };
 
         preloadWindow.rootViewController = vc;
@@ -503,9 +511,10 @@
 
 - (void)dismissPreloadAndStartUnity
 {
+    NSUInteger generation = self.pushTapGeneration;
     // Гарантируем выполнение на главном потоке
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.startingUnity || self.unityMode) return;
+        if (generation != self.pushTapGeneration || self.startingUnity || self.unityMode) return;
         self.startingUnity = YES;
         UIWindow *preloadWindow = self.preloadWindow;
 
@@ -517,6 +526,13 @@
             preloadWindow.alpha = 0.0;
         }
                          completion:^(BOOL finished) {
+            if (generation != self.pushTapGeneration) {
+                // A push arrived during the fade. Keep the web-owning window alive.
+                preloadWindow.alpha = 1.0;
+                self.startingUnity = NO;
+                [self pl_presentationMayBeReady:nil];
+                return;
+            }
             preloadWindow.hidden = YES;
             self.preloadWindow = nil;
             self.preloadInProgress = NO;

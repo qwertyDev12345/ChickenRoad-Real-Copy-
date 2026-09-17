@@ -393,6 +393,19 @@ jobs:
           echo "MATCH_GIT_BASIC_AUTHORIZATION=$(cat base64.txt)" >> $GITHUB_ENV
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: Run native push and WebView regression tests
+        if: github.event.inputs.apply_patch == 'true'
+        timeout-minutes: 25
+        run: bundle exec bash EasyLaunch-Patch/Tests/run_ios_tests.sh
+
+      - name: Save native routing test results
+        if: always() && github.event.inputs.apply_patch == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: easylaunch-routing-tests
+          path: build/routing-tests/*.xcresult
+          if-no-files-found: warn
           
       - name: Build & upload iOS binary
         run: bundle exec fastlane ios build_upload_testflight

@@ -2,7 +2,11 @@
 set -euo pipefail
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${1:-$TESTS_DIR/../../build/routing-tests}"
-DESTINATION="${IOS_TEST_DESTINATION:-platform=iOS Simulator,name=iPhone 16}"
+DESTINATION="${IOS_TEST_DESTINATION:-}"
+if [[ -z "$DESTINATION" ]]; then
+  DESTINATION="$(xcrun simctl list devices available --json | python3 "$TESTS_DIR/select_simulator.py")"
+fi
+echo "Routing test destination: $DESTINATION"
 mkdir -p "$OUTPUT_DIR"
 ruby "$TESTS_DIR/create_project.rb" "$OUTPUT_DIR"
 python3 "$TESTS_DIR/redirect_server.py" &

@@ -7,7 +7,7 @@ gem install xcodeproj --no-document
 IOS_TEST_DESTINATION='platform=iOS Simulator,name=iPhone 16' bash EasyLaunch-Patch/Tests/run_ios_tests.sh
 ```
 
-The script creates a separate test project under `build/routing-tests`; it does not modify the Unity export or use production Firebase credentials. The local HTTP fixture uses port 18765. Choose an available simulator in `IOS_TEST_DESTINATION`. XCTest results are retained as `.xcresult`.
+The script creates a separate test project under `build/routing-tests`; it does not modify the Unity export or use production Firebase credentials. The local HTTP fixture uses port 18765. An available iPhone simulator is selected automatically; optionally override it with `IOS_TEST_DESTINATION`. XCTest results are retained as `.xcresult`. The patched GitHub Actions build now runs this suite before TestFlight upload and saves `easylaunch-routing-tests`; test failures block upload.
 
 The suite compiles the actual CustomAppController, PreloadViewController, NotificationPromptViewController and WebViewController. Unity and the service wrapper are stubbed: it tests the UIKit/WebKit routing but cannot validate Firebase swizzling or real APNs delivery.
 
@@ -26,8 +26,11 @@ Device acceptance is still required on the newly built app:
    Also test a fresh install: Allow and Deny must both continue to WebView. With system permission previously denied, enable it in Settings, return to the app, and verify WebView opens. Capture the interval from the permission response to the visible page.
 5. Switch to Unity mode and repeat background/foreground and push navigation.
 6. On the file test, choose a camera image on the first attempt, cancel and retry, and choose an ordinary file. Repeat with a push received/tapped while a native picker is open. Verify no second WebView covers the picker; after it closes the latest requested destination should open in the original WebView.
+7. Cold-start via 777, including offline and a connection dropped before any content appears. Loading must be visible; failure must show an error and safe manual retry. Retry must retain that push's URL, not the previous page/config URL. Then tap a newer push while an error/recovery is pending. Repeat on the actual production redirect URL: the local fixture cannot validate its server or JavaScript.
 
-Identify the installed source by the launch log `routing revision 2026-09-16-r3` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
+The r4 regressions cover notification responses before Unity/preload entry, latest early push transfer, interruption of config checks, stale startup callbacks, a push during the Unity fade, a real dropped first-load connection, same-target retry, stale failure/finish events, loading deadline ownership and POST/process-recovery safety. Permission completion ordering and the older redirect/modal regressions remain in the suite. The 45-second no-commit UI deadline is tested by invoking its production handler, not by waiting 45 seconds. This is not evidence that a valid page's own JavaScript cannot render black after content commits.
+
+Identify the installed source by the launch log `routing revision 2026-09-17-r4` and the build number. Presentation logs distinguish `WebView opening deferred`, `WebView still waiting` (URL retained), and `WebView destination delivered in owner window`. Load errors now show their domain/code on screen. If the process still terminates, export the matching `.ips` (including Exception Type and Last Exception Backtrace/Triggered by Thread). A screen recording confirms the symptom but not the native exception or offending thread.
 
 These iOS tests have not been executed in the Windows workspace. Local checks must not be reported as a successful device run.
 
@@ -38,7 +41,7 @@ These iOS tests have not been executed in the Windows workspace. Local checks mu
 Run portable tests with:
 
 ```sh
-python3 -B -m unittest discover -s EasyLaunch-Patch/Tests -p test_verify_patch.py -v
+python3 -B -m unittest discover -s EasyLaunch-Patch/Tests -p 'test_*.py' -v
 ```
 
 ## Evidence from the September 14 device log (reported build 1 (8))

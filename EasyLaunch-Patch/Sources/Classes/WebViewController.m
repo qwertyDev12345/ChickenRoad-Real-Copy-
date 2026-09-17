@@ -13,6 +13,13 @@
 @property (nonatomic, strong) NSURL *lastServerRedirectURL;
 @property (nonatomic, strong) NSMutableSet<NSString *> *resumedRedirectURLs;
 @property (nonatomic, assign) NSUInteger processRecoveryCount;
+@property (nonatomic, copy) NSURLRequest *retryRequest;
+@property (nonatomic, strong) UIView *loadStatusView;
+@property (nonatomic, strong) UIActivityIndicatorView *loadSpinner;
+@property (nonatomic, strong) UILabel *loadStatusLabel;
+@property (nonatomic, strong) UIButton *retryButton;
+@property (nonatomic, assign) BOOL displayingLoadError;
+@property (nonatomic, assign) NSUInteger loadStatusGeneration;
 
 @end
 
@@ -85,6 +92,7 @@
         [self.webView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [self.webView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor]
     ]];
+    [self pl_setupLoadStatus];
 
     // Hard-lock scroll view zoom scale so pinch-to-zoom is impossible
     self.webView.scrollView.minimumZoomScale = 1.0;
@@ -129,16 +137,120 @@
 }
 
 #pragma mark - WKNavigationDelegate
+- (void)pl_setupLoadStatus
+{
+    self.loadStatusView = [UIView new];
+    self.loadStatusView.backgroundColor = UIColor.blackColor;
+    self.loadStatusView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.loadStatusView.accessibilityIdentifier = @"web-load-status";
+    self.loadStatusView.hidden = YES;
+    [self.view addSubview:self.loadStatusView];
+    self.loadSpinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    self.loadSpinner.color = UIColor.whiteColor;
+    self.loadStatusLabel = [UILabel new];
+    self.loadStatusLabel.textColor = UIColor.whiteColor;
+    self.loadStatusLabel.textAlignment = NSTextAlignmentCenter;
+    self.loadStatusLabel.numberOfLines = 0;
+    self.retryButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.retryButton setTitle:@"Try again" forState:UIControlStateNormal];
+    self.retryButton.accessibilityIdentifier = @"web-retry";
+    [self.retryButton addTarget:self action:@selector(pl_retryLoading) forControlEvents:UIControlEventTouchUpInside];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.loadSpinner, self.loadStatusLabel, self.retryButton]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 20;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.loadStatusView addSubview:stack];
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [self.loadStatusView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [self.loadStatusView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
+        [self.loadStatusView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [self.loadStatusView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [stack.centerYAnchor constraintEqualToAnchor:self.loadStatusView.centerYAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:self.loadStatusView.leadingAnchor constant:24],
+        [stack.trailingAnchor constraintEqualToAnchor:self.loadStatusView.trailingAnchor constant:-24]
+    ]];
+}
+
+- (BOOL)pl_isSafeRequest:(NSURLRequest *)request
+{
+    NSString *method = request.HTTPMethod ?: @"GET";
+    NSString *scheme = request.URL.scheme.lowercaseString;
+    return request.URL.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) &&
+        ([method isEqualToString:@"GET"] || [method isEqualToString:@"HEAD"]);
+}
+
+- (void)pl_showLoading
+{
+    self.displayingLoadError = NO;
+    self.loadStatusView.hidden = NO;
+    self.loadSpinner.hidden = NO;
+    [self.loadSpinner startAnimating];
+    self.loadStatusLabel.text = @"Loading…";
+    self.retryButton.hidden = YES;
+    NSUInteger statusGeneration = ++self.loadStatusGeneration;
+    // A cancelled/never-committed first navigation must not leave a blank screen.
+    // This is a UI deadline, not an automatic reload or a TLS/ATS bypass.
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [weakSelf pl_loadingDeadlineExpired:statusGeneration];
+    });
+}
+
+- (void)pl_loadingDeadlineExpired:(NSUInteger)generation
+{
+    if (generation != self.loadStatusGeneration) return;
+    self.activeNavigation = nil;
+    [self.webView stopLoading];
+    [self pl_showLoadError:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil]];
+}
+
+- (void)pl_hideLoadStatus
+{
+    self.loadStatusGeneration++;
+    self.displayingLoadError = NO;
+    self.loadStatusView.hidden = YES;
+    [self.loadSpinner stopAnimating];
+}
+
+- (void)pl_showLoadError:(NSError *)error
+{
+    self.navigationGeneration++; // Invalidate any queued redirect/process recovery.
+    self.loadStatusGeneration++;
+    self.displayingLoadError = YES;
+    self.loadStatusView.hidden = NO;
+    [self.loadSpinner stopAnimating];
+    self.loadSpinner.hidden = YES;
+    BOOL safeRetry = [self pl_isSafeRequest:self.retryRequest] && [self pl_isSafeRequest:self.mainFrameRequest];
+    self.retryButton.hidden = !safeRetry;
+    self.loadStatusLabel.text = [NSString stringWithFormat:@"Unable to load this page.\n%@\n(%@ %ld)%@",
+        error.localizedDescription, error.domain, (long)error.code,
+        safeRetry ? @"" : @"\nThis request cannot be safely repeated. Open the notification again to return to its link."];
+    NSLog(@"[WebViewController] load failed: domain=%@ code=%ld host=%@ generation=%lu",
+        error.domain, (long)error.code, self.url.host, (unsigned long)self.navigationGeneration);
+}
+
+- (void)pl_retryLoading
+{
+    // Read the current request here, never a URL captured by an old error callback.
+    if (!self.displayingLoadError || ![self pl_isSafeRequest:self.retryRequest] ||
+        ![self pl_isSafeRequest:self.mainFrameRequest]) return;
+    [self.webView stopLoading];
+    [self pl_loadRequest:self.retryRequest resetRedirects:YES];
+}
+
 - (void)pl_loadRequest:(NSURLRequest *)request resetRedirects:(BOOL)reset
 {
     if (reset) {
         [self.resumedRedirectURLs removeAllObjects];
         self.processRecoveryCount = 0;
+        self.retryRequest = request;
     }
     self.navigationGeneration++;
     self.url = request.URL;
     self.lastServerRedirectURL = nil;
     self.mainFrameRequest = request;
+    [self pl_showLoading];
     self.activeNavigation = [self.webView loadRequest:request];
 }
 
@@ -152,7 +264,15 @@
         self.navigationGeneration++;
         [self.resumedRedirectURLs removeAllObjects];
         self.processRecoveryCount = 0;
+        self.retryRequest = self.mainFrameRequest;
     }
+    [self pl_showLoading];
+}
+
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation
+{
+    if (navigation != self.activeNavigation) return;
+    [self pl_hideLoadStatus];
 }
 
 - (void)webView:(WKWebView *)webView didReceiveServerRedirectForProvisionalNavigation:(WKNavigation *)navigation
@@ -163,6 +283,7 @@
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error
 {
+    if (navigation != self.activeNavigation) return;
     // Ignore cancellations (e.g. triggered by our own decidePolicyForNavigationAction)
     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
         return;
@@ -171,8 +292,7 @@
     NSLog(@"[WebViewController] navigation error (domain=%@ code=%ld): %@",
           error.domain, (long)error.code, error.localizedDescription);
 
-    // WebKit owns redirect and recovery semantics. Retrying a failed navigation
-    // here can race a newer push navigation and crash the web-content process.
+    [self pl_showLoadError:error];
 }
 
 // Track navigation actions (this provides the redirect chain)
@@ -269,10 +389,13 @@
         }
     }
     NSLog(@"[WebViewController] provisional navigation failed: %@", error);
+    [self pl_showLoadError:error];
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
 {
+    if (navigation != self.activeNavigation) return;
+    [self pl_hideLoadStatus];
     NSLog(@"[WebViewController] finished loading: %@", webView.URL);
     self.processRecoveryCount = 0;
     // Restore only zoom limits; never replace WKWebView's internal scroll delegate.
@@ -285,20 +408,21 @@
 // (e.g. memory pressure). Without this the WebView stays blank forever.
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView
 {
-    NSLog(@"[WebViewController] WKWebView content process terminated — reloading");
-    if (self.processRecoveryCount >= 1) return;
+    NSLog(@"[WebViewController] WKWebView content process terminated");
+    if (self.processRecoveryCount >= 1 || ![self pl_isSafeRequest:self.mainFrameRequest]) {
+        [self pl_showLoadError:[NSError errorWithDomain:WKErrorDomain code:WKErrorWebContentProcessTerminated userInfo:nil]];
+        return;
+    }
     self.processRecoveryCount++;
     NSUInteger generation = self.navigationGeneration;
+    NSURLRequest *recoveryRequest = self.mainFrameRequest;
+    [self pl_showLoading];
     // Brief delay to let the process fully clean up before reloading
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (generation != self.navigationGeneration) return;
-        // During a push load webView.URL can still belong to the previous page.
-        if (self.url) {
-            NSURLRequest *req = [NSURLRequest requestWithURL:self.url
-                                                cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                            timeoutInterval:WebViewConfigNavigationTimeout];
-            [self pl_loadRequest:req resetRedirects:NO];
-        }
+        // Preserve the safe request/method; never turn a failed POST into a GET.
+        // webView.URL can still belong to the previous push at this point.
+        [self pl_loadRequest:recoveryRequest resetRedirects:NO];
     });
 }
 

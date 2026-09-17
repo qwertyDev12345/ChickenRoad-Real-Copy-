@@ -72,6 +72,10 @@ typedef void (^PreloadOpenURLBlock)(NSURL *url);
 /// Если установлен до viewDidAppear — цепочка проверок пропускается и сразу
 /// вызывается onOpenURL с этим URL.
 @property (nonatomic, strong, nullable) NSURL *pendingPushURL;
+/// Main-thread routing token owned by CustomAppController, not by server callbacks.
+@property (nonatomic, assign) NSUInteger routingGeneration;
+/// Interrupt unfinished config checks; an in-flight permission flow finishes first.
+- (void)acceptPushURL:(NSURL *)url;
 /// A preload run may hand control to the app only once.
 @property (nonatomic, assign, readonly) BOOL hasFinished;
 

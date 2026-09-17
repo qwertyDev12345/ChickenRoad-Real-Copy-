@@ -16,6 +16,7 @@ extern NSData *PLTestAPNsToken;
 - (BOOL)pl_isApplicationActive;
 - (UIWindow *)pl_presentationWindow;
 - (void)pl_drainPendingOpen;
+- (void)dismissPreloadAndStartUnity;
 @end
 @interface NotificationPromptViewController (TestAccess)
 - (void)onAllow:(id)sender;
@@ -28,6 +29,10 @@ extern NSData *PLTestAPNsToken;
 @interface WebViewController (TestAccess)
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error;
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView;
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error;
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation;
+- (void)pl_retryLoading;
+- (void)pl_loadingDeadlineExpired:(NSUInteger)generation;
 @end
 
 // Intercepts only the OS permission dialog/network entry; the production
@@ -105,6 +110,84 @@ extern NSData *PLTestAPNsToken;
 }
 - (NSURL *)URL:(NSString *)path {
     return [NSURL URLWithString:[@"http://127.0.0.1:18765" stringByAppendingString:path]];
+}
+- (void)tapPush:(NSString *)path app:(CustomAppController *)app {
+    UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+    content.userInfo = @{@"click_url": [self URL:path].absoluteString};
+    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:path content:content trigger:nil];
+    [app userNotificationCenter:nil didReceiveNotificationResponse:[self responseForRequest:request] withCompletionHandler:^{}];
+    [self drainMainQueue];
+}
+- (void)testPushBeforeUnityEntryIsTransferredToStartupNotRuntimeQueue {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    XCTAssertFalse([[app valueForKey:@"preloadInProgress"] boolValue]);
+    [self tapPush:@"/push-a" app:app];
+    [self tapPush:@"/777" app:app];
+    XCTAssertEqualObjects([[app valueForKey:@"pendingPushURL"] path], @"/777");
+    XCTAssertNil([app valueForKey:@"deferredOpenURL"]);
+    [app initUnityWithScene:nil];
+    [self drainMainQueue];
+    self.testWindow = [app valueForKey:@"preloadWindow"];
+    XCTAssertNotNil(self.testWindow);
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/777"];
+    XCTAssertTrue([(PreloadViewController *)self.testWindow.rootViewController hasFinished]);
+    XCTAssertNil([app valueForKey:@"pendingPushURL"]);
+}
+- (void)testLateStartupCallbackCannotReplaceSecondRuntimePush {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    [self tapPush:@"/push-a" app:app];
+    [app initUnityWithScene:nil];
+    [self drainMainQueue];
+    self.testWindow = [app valueForKey:@"preloadWindow"];
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/push-a"];
+    PreloadViewController *preload = (id)self.testWindow.rootViewController;
+    [self tapPush:@"/777" app:app];
+    // Exercise the app's callback guard independently of preload's one-shot guard.
+    preload.onOpenURL([self URL:@"/stale-config"]);
+    preload.onComplete();
+    [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/777"];
+    XCTAssertFalse([[app valueForKey:@"unityMode"] boolValue]);
+    XCTAssertEqual(self.testWindow.rootViewController.presentedViewController, web);
+}
+- (void)testPushInterruptsConfigAndIgnoresItsLateCompletion {
+    PermissionPreload *preload = [PermissionPreload new];
+    __block NSUInteger opens = 0;
+    __block NSURL *opened;
+    __block NSUInteger unityStarts = 0;
+    preload.onOpenURL = ^(NSURL *url) { opens++; opened = url; };
+    preload.onComplete = ^{ unityStarts++; };
+    [preload startChecks]; // stub leaves config chain pending
+    [preload acceptPushURL:[self URL:@"/777"]];
+    [preload pl_finishWithURL:[self URL:@"/late-config"]];
+    [preload pl_finishWithURL:nil];
+    [self drainMainQueue];
+    XCTAssertEqual(opens, 1u);
+    XCTAssertEqualObjects(opened.path, @"/777");
+    XCTAssertEqual(unityStarts, 0u);
+    XCTAssertEqual(preload.permissionCount, 0u);
+}
+- (void)testPushDuringUnityFadePreservesWebOwningWindow {
+    RoutingApp *app = [RoutingApp new];
+    app.simulatedActive = YES;
+    PermissionPreload *root = [PermissionPreload new];
+    [self showRoutingRoot:root app:app];
+    [root setValue:@YES forKey:@"hasFinished"];
+    [app setValue:@YES forKey:@"preloadInProgress"];
+    [app dismissPreloadAndStartUnity];
+    [self drainMainQueue];
+    XCTAssertTrue([[app valueForKey:@"startingUnity"] boolValue]);
+    [self tapPush:@"/777" app:app];
+    WebViewController *web = [self waitForRoutedWebView:app];
+    [self waitForWebView:web path:@"/777"];
+    XCTAssertFalse([[app valueForKey:@"unityMode"] boolValue]);
+    XCTAssertEqual([app valueForKey:@"preloadWindow"], self.testWindow);
+    XCTAssertEqual(self.testWindow.alpha, 1.0);
+    XCTAssertFalse(self.testWindow.hidden);
 }
 - (void)testExplicitClickURLWinsOverGenericURL {
     NSDictionary *payload = @{@"url": [self URL:@"/generic"].absoluteString,
@@ -367,8 +450,9 @@ extern NSData *PLTestAPNsToken;
     [vc pl_finishWithURL:[self URL:@"/stale-server"]];
     [self drainMainQueue];
     XCTAssertEqual(vc.permissionCount, 1u);
-    vc.pendingPushURL = [self URL:@"/push-a"];
-    vc.pendingPushURL = [self URL:@"/push-b"];
+    [vc acceptPushURL:[self URL:@"/push-a"]];
+    [vc acceptPushURL:[self URL:@"/push-b"]];
+    XCTAssertFalse(vc.hasFinished); // permission still owns the handoff
     vc.permissionCompletion();
     vc.permissionCompletion();
     [vc viewDidAppear:NO];
@@ -383,13 +467,16 @@ extern NSData *PLTestAPNsToken;
     window.rootViewController = vc;
     [app setValue:window forKey:@"preloadWindow"];
     [app setValue:@"first-id" forKey:@"coldStartMessageID"];
+    __block NSURL *opened;
+    vc.onOpenURL = ^(NSURL *url) { opened = url; };
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.userInfo = @{@"gcm.message_id": @"second-id", @"click_url": [self URL:@"/push-b"].absoluteString};
     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:@"second-id" content:content trigger:nil];
     NSObject *response = [self responseForRequest:request];
     [app userNotificationCenter:nil didReceiveNotificationResponse:(id)response withCompletionHandler:^{}];
     [self drainMainQueue];
-    XCTAssertEqualObjects(vc.pendingPushURL.path, @"/push-b");
+    XCTAssertEqualObjects(opened.path, @"/push-b");
+    XCTAssertEqual(vc.routingGeneration, 1u);
 }
 - (id)responseForRequest:(UNNotificationRequest *)request {
     TestNotification *notification = [TestNotification new];
@@ -460,5 +547,93 @@ extern NSData *PLTestAPNsToken;
     [self waitForExpectations:@[delay] timeout:3];
     [self waitForWebView:vc path:@"/push-b"];
     XCTAssertEqual(web, [vc valueForKey:@"webView"]);
+}
+- (void)testFirstLoadNetworkFailureShowsErrorInsteadOfBlackScreen {
+    WebViewController *vc = [self showWebView:@"/disconnect"];
+    NSPredicate *failed = [NSPredicate predicateWithBlock:^BOOL(id object, NSDictionary *bindings) {
+        return [[vc valueForKey:@"displayingLoadError"] boolValue];
+    }];
+    XCTNSPredicateExpectation *shown = [[XCTNSPredicateExpectation alloc] initWithPredicate:failed object:nil];
+    [self waitForExpectations:@[shown] timeout:30]; // allow a cold WebKit process on CI
+    XCTAssertFalse([[vc valueForKey:@"loadStatusView"] isHidden]);
+    XCTAssertFalse([[vc valueForKey:@"retryButton"] isHidden]);
+    XCTAssertEqualObjects([[vc valueForKey:@"retryRequest"] URL].path, @"/disconnect");
+}
+- (void)testRetryKeepsClickedURLAndNewPushInvalidatesOldErrorActions {
+    WebViewController *vc = [self showWebView:@"/a"];
+    [self waitForWebView:vc path:@"/a"];
+    WKWebView *web = [vc valueForKey:@"webView"];
+    [vc navigateToURL:[self URL:@"/777"]];
+    [web stopLoading];
+    WKNavigation *failed = [vc valueForKey:@"activeNavigation"];
+    NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorNotConnectedToInternet userInfo:nil];
+    [vc webView:web didFailProvisionalNavigation:failed withError:error];
+    XCTAssertTrue([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    [vc pl_retryLoading];
+    XCTAssertEqualObjects([[vc valueForKey:@"mainFrameRequest"] URL].path, @"/777");
+    [self waitForWebView:vc path:@"/777"];
+    XCTAssertTrue([[vc valueForKey:@"loadStatusView"] isHidden]);
+    [vc navigateToURL:[self URL:@"/new-push"]];
+    WKNavigation *latest = [vc valueForKey:@"activeNavigation"];
+    [vc webView:web didFailNavigation:failed withError:error];
+    [vc webView:web didFailProvisionalNavigation:failed withError:error];
+    [vc webView:web didFinishNavigation:failed];
+    [vc pl_retryLoading]; // stale UI action cannot replay 777
+    XCTAssertEqual([vc valueForKey:@"activeNavigation"], latest);
+    XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    XCTAssertFalse([[vc valueForKey:@"loadStatusView"] isHidden]);
+    [self waitForWebView:vc path:@"/new-push"];
+}
+- (void)testLoadingDeadlineCannotStopNewerPushOrCompletedPage {
+    WebViewController *vc = [self showWebView:@"/a"];
+    NSUInteger old = [[vc valueForKey:@"loadStatusGeneration"] unsignedIntegerValue];
+    [vc navigateToURL:[self URL:@"/777"]];
+    WKNavigation *current = [vc valueForKey:@"activeNavigation"];
+    [vc pl_loadingDeadlineExpired:old];
+    XCTAssertEqual([vc valueForKey:@"activeNavigation"], current);
+    XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    NSUInteger pending = [[vc valueForKey:@"loadStatusGeneration"] unsignedIntegerValue];
+    [self waitForWebView:vc path:@"/777"];
+    [vc pl_loadingDeadlineExpired:pending];
+    XCTAssertTrue([[vc valueForKey:@"loadStatusView"] isHidden]);
+}
+- (void)testLoadingDeadlineShowsRetryForCurrentDestination {
+    WebViewController *vc = [self showWebView:@"/777"];
+    [vc pl_loadingDeadlineExpired:[[vc valueForKey:@"loadStatusGeneration"] unsignedIntegerValue]];
+    XCTAssertTrue([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    XCTAssertNil([vc valueForKey:@"activeNavigation"]);
+    XCTAssertFalse([[vc valueForKey:@"retryButton"] isHidden]);
+    [vc pl_retryLoading];
+    [self waitForWebView:vc path:@"/777"];
+}
+- (void)testPOSTFailureDisablesRetryAndAutomaticProcessRecovery {
+    WebViewController *vc = [self showWebView:@"/a"];
+    [self waitForWebView:vc path:@"/a"];
+    NSMutableURLRequest *post = [NSMutableURLRequest requestWithURL:[self URL:@"/payment"]];
+    post.HTTPMethod = @"POST";
+    post.HTTPBody = [@"amount=1" dataUsingEncoding:NSUTF8StringEncoding];
+    [vc setValue:post forKey:@"mainFrameRequest"];
+    [vc setValue:post forKey:@"retryRequest"];
+    WKNavigation *navigation = [vc valueForKey:@"activeNavigation"];
+    [vc webViewWebContentProcessDidTerminate:[vc valueForKey:@"webView"]];
+    [vc pl_retryLoading];
+    [self drainMainQueue];
+    XCTAssertTrue([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    XCTAssertTrue([[vc valueForKey:@"retryButton"] isHidden]);
+    XCTAssertEqual(navigation, [vc valueForKey:@"activeNavigation"]);
+    XCTAssertEqual([[vc valueForKey:@"processRecoveryCount"] unsignedIntegerValue], 0u);
+}
+- (void)testRepeatedProcessFailureCancelsAlreadyQueuedRecovery {
+    WebViewController *vc = [self showWebView:@"/a"];
+    [self waitForWebView:vc path:@"/a"];
+    WKWebView *web = [vc valueForKey:@"webView"];
+    WKNavigation *navigation = [vc valueForKey:@"activeNavigation"];
+    [vc webViewWebContentProcessDidTerminate:web];
+    [vc webViewWebContentProcessDidTerminate:web];
+    XCTestExpectation *delay = [self expectationWithDescription:@"recovery delay elapsed"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [delay fulfill]; });
+    [self waitForExpectations:@[delay] timeout:3];
+    XCTAssertEqual(navigation, [vc valueForKey:@"activeNavigation"]);
+    XCTAssertTrue([[vc valueForKey:@"displayingLoadError"] boolValue]);
 }
 @end
