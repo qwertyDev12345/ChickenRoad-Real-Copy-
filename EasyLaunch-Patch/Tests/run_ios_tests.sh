@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 -B -m unittest discover -s "$TESTS_DIR" -p 'test_*.py' -v
 OUTPUT_DIR="${1:-$TESTS_DIR/../../build/routing-tests}"
 DESTINATION="${IOS_TEST_DESTINATION:-}"
 if [[ -z "$DESTINATION" ]]; then

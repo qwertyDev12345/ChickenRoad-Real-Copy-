@@ -5,10 +5,12 @@
 #import "PreloadViewController.h"
 #import "NotificationPromptViewController.h"
 #import "WebViewController.h"
+#import "WebViewConfig.h"
 
 extern NSData *PLTestAPNsToken;
 @interface CustomAppController (TestAccess)
 + (NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)info;
++ (NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)info selectedField:(NSString **)field;
 - (void)application:(UIApplication *)app didReceiveRemoteNotification:(NSDictionary *)info fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completion;
 - (void)application:(UIApplication *)app didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)token;
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completion;
@@ -125,7 +127,10 @@ extern NSData *PLTestAPNsToken;
 }
 - (void)tapPush:(NSString *)path app:(CustomAppController *)app {
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
-    content.userInfo = @{@"click_url": [self URL:path].absoluteString};
+    // Exercise the reference contract throughout cold/warm/two-push tests.
+    // A conflicting legacy field must never replace this notification's url.
+    content.userInfo = @{@"url": [self URL:path].absoluteString,
+                         @"click_url": [self URL:@"/wrong-click-target"].absoluteString};
     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:path content:content trigger:nil];
     [app userNotificationCenter:nil didReceiveNotificationResponse:[self responseForRequest:request] withCompletionHandler:^{}];
     [self drainMainQueue];
@@ -201,13 +206,21 @@ extern NSData *PLTestAPNsToken;
     XCTAssertEqual(self.testWindow.alpha, 1.0);
     XCTAssertFalse(self.testWindow.hidden);
 }
-- (void)testExplicitClickURLWinsOverGenericURL {
+- (void)testURLWinsOverClickURLLikeFlutter {
     NSDictionary *payload = @{@"url": [self URL:@"/generic"].absoluteString,
         @"click_url": [self URL:@"/clicked"].absoluteString};
-    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:payload].path, @"/clicked");
+    NSString *field = nil;
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:payload selectedField:&field].path, @"/generic");
+    XCTAssertEqualObjects(field, @"root.url");
     NSDictionary *nested = @{@"url": [self URL:@"/generic"].absoluteString,
         @"data": @{@"click_url": [self URL:@"/nested-click"].absoluteString}};
-    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:nested].path, @"/nested-click");
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:nested].path, @"/generic");
+    NSDictionary *nestedURL = @{@"click_url": [self URL:@"/clicked"].absoluteString,
+        @"data": @{@"url": [self URL:@"/nested-url"].absoluteString}};
+    XCTAssertEqualObjects([CustomAppController pl_pushURLFromUserInfo:nestedURL selectedField:&field].path, @"/nested-url");
+    XCTAssertEqualObjects(field, @"data.url");
+    XCTAssertNil([CustomAppController pl_pushURLFromUserInfo:@{} selectedField:&field]);
+    XCTAssertNil(field);
 }
 - (void)testInvalidCandidateDoesNotHideValidPayloadURL {
     NSDictionary *payload = @{@"click_url": @"javascript:alert(1)", @"url": @"not a URL",
@@ -520,6 +533,30 @@ extern NSData *PLTestAPNsToken;
     [web evaluateJavaScript:@"document.getElementById('skipBtn').click()" completionHandler:nil];
     [self waitForWebView:vc path:@"/final"];
     XCTAssertEqualObjects(web.URL.query, @"case=skip");
+}
+- (void)testBrowserRequestsUseFoundationDefaultsAndCancelDoesNotReload {
+    WebViewController *vc = [self showWebView:@"/first-default"];
+    NSURLRequest *defaults = [NSURLRequest requestWithURL:[self URL:@"/first-default"]];
+    NSURLRequest *initial = [vc valueForKey:@"mainFrameRequest"];
+    XCTAssertEqual(initial.cachePolicy, defaults.cachePolicy);
+    XCTAssertEqual(initial.timeoutInterval, defaults.timeoutInterval);
+    XCTAssertEqual(WebViewConfigNavigationTimeout, defaults.timeoutInterval);
+    [self waitForWebView:vc path:@"/first-default"];
+    [vc navigateToURL:[self URL:@"/777?source=push"]];
+    NSURLRequest *push = [vc valueForKey:@"mainFrameRequest"];
+    XCTAssertEqual(push.cachePolicy, defaults.cachePolicy);
+    XCTAssertEqual(push.timeoutInterval, defaults.timeoutInterval);
+    WKNavigation *navigation = [vc valueForKey:@"activeNavigation"];
+    NSError *cancel = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+    [vc webView:[vc valueForKey:@"webView"] didFailProvisionalNavigation:navigation withError:cancel];
+    [vc webView:[vc valueForKey:@"webView"] didFailNavigation:navigation withError:cancel];
+    XCTAssertEqual(navigation, [vc valueForKey:@"activeNavigation"]);
+    XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    NSString *report = [vc pl_diagnosticReportForError:cancel source:@"test"];
+    XCTAssertTrue([report containsString:@"EASYLAUNCH DIAG r6"]);
+    XCTAssertTrue([report containsString:@"UI deadline=75s"]);
+    XCTAssertTrue([report containsString:@"Web ATS exception=yes"]);
+    [self waitForWebView:vc path:@"/777"];
 }
 - (void)testTooManyRedirectsDoesNotReplayPOST {
     WebViewController *vc = [self showWebView:@"/a"];

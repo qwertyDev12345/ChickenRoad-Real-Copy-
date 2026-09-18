@@ -23,7 +23,8 @@ class VerifyPatchTests(unittest.TestCase):
             if path.suffix in {".h", ".m", ".mm"}:
                 shutil.copyfile(path, self.export / "Classes" / path.name)
         with (self.export / "Info.plist").open("wb") as stream:
-            plistlib.dump({"CFBundleIdentifier": "test.app", "ExistingSetting": True}, stream)
+            plistlib.dump({"CFBundleIdentifier": "test.app", "ExistingSetting": True,
+                          "NSAppTransportSecurity": {"NSAllowsArbitraryLoadsInWebContent": True}}, stream)
 
     def test_current_sources_stamp_commit_and_preserve_settings(self):
         result = MODULE.verify(SOURCE, self.export, "test-commit")
@@ -32,6 +33,7 @@ class VerifyPatchTests(unittest.TestCase):
         self.assertEqual(info["EasyLaunchSourceCommit"], "test-commit")
         self.assertEqual(info["EasyLaunchPatchSHA256"], result["native_sources_sha256"])
         self.assertTrue(info["ExistingSetting"])
+        self.assertTrue(result["web_ats_exception"])
         self.assertEqual(json.loads((self.export / "easylaunch-build.json").read_text()), result)
         self.assertEqual(MODULE.verify(SOURCE, self.export, "test-commit"), result)
 
@@ -53,6 +55,17 @@ class VerifyPatchTests(unittest.TestCase):
         result = MODULE.verify(SOURCE, self.export)
         self.assertNotIn("EasyLaunchConfig.h", result["files"])
         self.assertNotIn("private configuration", json.dumps(result))
+
+    def test_missing_web_policy_fails_before_stamping_export(self):
+        for ats in ({}, {"NSAllowsArbitraryLoadsInWebContent": False}, "malformed"):
+            with self.subTest(ats=ats):
+                plist_path = self.export / "Info.plist"
+                original = plistlib.dumps({"NSAppTransportSecurity": ats})
+                plist_path.write_bytes(original)
+                with self.assertRaisesRegex(ValueError, "missing WebView ATS policy"):
+                    MODULE.verify(SOURCE, self.export)
+                self.assertEqual(plist_path.read_bytes(), original)
+                self.assertFalse((self.export / "easylaunch-build.json").exists())
 
 
 if __name__ == "__main__":

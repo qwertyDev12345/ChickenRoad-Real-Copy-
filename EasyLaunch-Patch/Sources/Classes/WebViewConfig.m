@@ -1,7 +1,8 @@
 #import "WebViewConfig.h"
 
 BOOL const WebViewConfigShowCloseButton = YES;
-NSTimeInterval const WebViewConfigNavigationTimeout = 30.0;
+// Foundation's standard URLRequest timeout, matching the browser request defaults.
+NSTimeInterval const WebViewConfigNavigationTimeout = 60.0;
 
 UIColor *WebViewConfigTintColor(void)
 {

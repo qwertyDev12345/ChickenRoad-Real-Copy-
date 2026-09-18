@@ -5,6 +5,9 @@
 #import <UserNotifications/UserNotifications.h>
 #import <CommonCrypto/CommonDigest.h>
 
+// Leave time for the standard 60-second request before the no-commit UI guard.
+static NSTimeInterval const PLWebLoadingDeadline = 75.0;
+
 // Diagnostic text is deliberately built from allowlisted fields, never an
 // NSError description/userInfo dump, request headers, cookies or push payload.
 static NSString *PLDiagnosticAtom(NSString *text)
@@ -115,7 +118,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
         [self.webView stopLoading];
 
         NSURLRequest *request = [NSURLRequest requestWithURL:url
-                                                cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                                cachePolicy:NSURLRequestUseProtocolCachePolicy
                                             timeoutInterval:WebViewConfigNavigationTimeout];
         [self pl_loadRequest:request resetRedirects:YES];
     };
@@ -189,7 +192,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     }
 
     if (self.url) {
-        NSURLRequest *req = [NSURLRequest requestWithURL:self.url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:WebViewConfigNavigationTimeout];
+        NSURLRequest *req = [NSURLRequest requestWithURL:self.url cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:WebViewConfigNavigationTimeout];
         [self pl_loadRequest:req resetRedirects:YES];
     }
 }
@@ -270,11 +273,17 @@ static NSString *PLDiagnosticURL(NSURL *url)
     NSString *skipAge = [denied isKindOfClass:NSDate.class] ? [NSString stringWithFormat:@"%.1f hours", -denied.timeIntervalSinceNow / 3600.0] : @"not stored (may have been cleared on Allow)";
     UIWindow *window = self.viewIfLoaded.window;
     NSBundle *bundle = NSBundle.mainBundle;
+    NSDictionary *ats = [bundle objectForInfoDictionaryKey:@"NSAppTransportSecurity"];
+    id webException = [ats isKindOfClass:NSDictionary.class] ? ats[@"NSAllowsArbitraryLoadsInWebContent"] : nil;
+    id domainExceptions = [ats isKindOfClass:NSDictionary.class] ? ats[@"NSExceptionDomains"] : nil;
+    NSString *atsSummary = [NSString stringWithFormat:@"Web ATS exception=%@; domain overrides=%lu",
+        [webException respondsToSelector:@selector(boolValue)] && [webException boolValue] ? @"yes" : @"no",
+        (unsigned long)([domainExceptions isKindOfClass:NSDictionary.class] ? [domainExceptions count] : 0)];
     return [NSString stringWithFormat:
-        @"EASYLAUNCH DIAG r5\nSource: %@\nError: %@\nStage: %@\nElapsed: %.2fs; loads=%lu; redirects=%lu\n"
+        @"EASYLAUNCH DIAG r6\nSource: %@\nError: %@\nStage: %@\nElapsed: %.2fs; loads=%lu; redirects=%lu\n"
         @"Started=%@; committed=%@\nLast response: %@\n\nRoute URL (initial/push): %@\nCurrent request: %@\nLast redirect: %@\nWebView URL: %@\nFailing URL: %@\n\n"
-        @"Routing: %@\nMethod: %@; request timeout=%.0fs; UI deadline=45s\nApp state=%ld (0=active,1=inactive,2=background); scene=%ld\nAttached=%@; visible=%@; loading=%@; progress=%.2f\n"
-        @"Notifications: %@\nLast skip: %@\nSaved launch mode: %@\nData store: %@; custom UA: %@\n"
+        @"Routing: %@\nMethod: %@; request timeout=%.0fs; UI deadline=%.0fs\nApp state=%ld (0=active,1=inactive,2=background); scene=%ld\nAttached=%@; visible=%@; loading=%@; progress=%.2f\n"
+        @"Notifications: %@\nLast skip: %@\nSaved launch mode: %@\nData store: %@; custom UA: %@\n%@\n"
         @"App %@ (%@); iOS %@\nCommit: %@\nPatch: %@\nStarted UTC: %@\n\nLast 40 events (observed callbacks):\n%@\n\n"
         @"Privacy: credentials, query values and fragments hidden; selected path segments masked. Review host/path before sharing. No cookies, headers, request bodies or push payload included. URL id compares exact URLs, including hidden values.\n",
         source, [causes componentsJoinedByString:@" <- "], self.diagnosticStage,
@@ -283,12 +292,12 @@ static NSString *PLDiagnosticURL(NSURL *url)
         self.diagnosticDidStart ? @"yes" : @"no", self.diagnosticDidCommit ? @"yes" : @"no", self.diagnosticLastResponse,
         PLDiagnosticURL(self.diagnosticRouteURL), PLDiagnosticURL(self.mainFrameRequest.URL), PLDiagnosticURL(self.lastServerRedirectURL),
         PLDiagnosticURL(self.webView.URL), PLDiagnosticURL(failedURL), self.diagnosticContext ?: @"not supplied",
-        PLDiagnosticAtom(self.mainFrameRequest.HTTPMethod ?: @"GET"), self.mainFrameRequest.timeoutInterval,
+        PLDiagnosticAtom(self.mainFrameRequest.HTTPMethod ?: @"GET"), self.mainFrameRequest.timeoutInterval, PLWebLoadingDeadline,
         (long)UIApplication.sharedApplication.applicationState, window.windowScene ? (long)window.windowScene.activationState : -99L,
         window ? @"yes" : @"no", window && !window.hidden && window.alpha > 0 ? @"yes" : @"no",
         self.webView.loading ? @"yes" : @"no", self.webView.estimatedProgress,
         self.diagnosticPermission, skipAge, PLDiagnosticAtom([NSUserDefaults.standardUserDefaults stringForKey:@"PLLaunchMode"]),
-        self.webView.configuration.websiteDataStore.persistent ? @"persistent" : @"non-persistent", self.webView.customUserAgent.length ? @"set (hidden)" : @"default",
+        self.webView.configuration.websiteDataStore.persistent ? @"persistent" : @"non-persistent", self.webView.customUserAgent.length ? @"set (hidden)" : @"default", atsSummary,
         PLDiagnosticAtom([bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]), PLDiagnosticAtom([bundle objectForInfoDictionaryKey:@"CFBundleVersion"]),
         PLDiagnosticAtom(UIDevice.currentDevice.systemVersion), PLDiagnosticAtom([bundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"]),
         PLDiagnosticAtom([bundle objectForInfoDictionaryKey:@"EasyLaunchPatchSHA256"]), self.diagnosticStartedDate,
@@ -398,7 +407,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     // A cancelled/never-committed first navigation must not leave a blank screen.
     // This is a UI deadline, not an automatic reload or a TLS/ATS bypass.
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PLWebLoadingDeadline * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [weakSelf pl_loadingDeadlineExpired:statusGeneration];
     });
 }
@@ -408,7 +417,8 @@ static NSString *PLDiagnosticURL(NSURL *url)
     if (generation != self.loadStatusGeneration) return;
     self.activeNavigation = nil;
     [self.webView stopLoading];
-    [self pl_showLoadError:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil] source:@"app UI deadline (45s), NOT a WebKit error"];
+    [self pl_showLoadError:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil]
+                  source:[NSString stringWithFormat:@"app UI deadline (%.0fs), NOT a WebKit error", PLWebLoadingDeadline]];
 }
 
 - (void)pl_hideLoadStatus

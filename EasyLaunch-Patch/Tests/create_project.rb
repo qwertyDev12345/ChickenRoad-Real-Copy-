@@ -38,7 +38,8 @@ Xcodeproj::Plist.write_to_path({
   'CFBundleVersion' => '1',
   'CFBundleShortVersionString' => '1.0',
   'UILaunchScreen' => {},
-  'NSAppTransportSecurity' => {'NSAllowsLocalNetworking' => true}
+  # Match the production browser policy; no global URLSession ATS bypass.
+  'NSAppTransportSecurity' => {'NSAllowsArbitraryLoadsInWebContent' => true}
 }, app_plist)
 app.build_configurations.each do |config|
   config.build_settings['GENERATE_INFOPLIST_FILE'] = 'NO'

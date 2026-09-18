@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-patch_infoplist.py — добавляет NSCameraUsageDescription и NSMicrophoneUsageDescription
-в Info.plist если они ещё не присутствуют.
+patch_infoplist.py — добавляет разрешения камеры/микрофона и политику ATS
+для встроенного браузера. Применяется только к основному приложению.
 
 Использование:
     python3 patch_infoplist.py <path/to/Info.plist>
@@ -26,7 +26,19 @@ def patch(plist_path: str) -> None:
     with open(plist_path, "rb") as f:
         data = plistlib.load(f)
 
+    # Match the reference browser's HTTP navigation support, including HTTPS
+    # redirects to HTTP. Do NOT add NSAllowsArbitraryLoads or relax URLSession,
+    # media, certificate validation, or the notification-service extension.
+    # Existing domain-specific exceptions remain authoritative and untouched.
+    ats = data.get("NSAppTransportSecurity", {})
+    if not isinstance(ats, dict):
+        raise ValueError("NSAppTransportSecurity must be a dictionary")
     changed = False
+    if ats.get("NSAllowsArbitraryLoadsInWebContent") is not True:
+        ats["NSAllowsArbitraryLoadsInWebContent"] = True
+        data["NSAppTransportSecurity"] = ats
+        changed = True
+        print("[patch_infoplist] WebView ATS: allow HTTP web content (App Store justification required)")
     for key, value in KEYS.items():
         if key not in data:
             data[key] = value

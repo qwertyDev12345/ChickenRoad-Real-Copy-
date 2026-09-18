@@ -1,5 +1,34 @@
 # Push and redirect regression checks
 
+## r6: Flutter reference compatibility (September 18)
+
+- Valid `url` fields (root, data, aps) now precede legacy `click_url` fields,
+  matching the reference sender contract and superseding r3 below. Reports name
+  the selected field, e.g. `field=root.url`, without dumping the payload.
+- The main app's Info.plist explicitly enables
+  `NSAppTransportSecurity.NSAllowsArbitraryLoadsInWebContent`, like the reference.
+  This permits HTTP web content/redirects and requires App Store justification.
+  No global ATS/media exception or certificate-authentication bypass is added.
+  Existing domain exceptions remain authoritative. On modern iOS the web key
+  also overrides an existing global `NSAllowsArbitraryLoads`; check separately
+  configured non-web HTTP clients when integrating into another project.
+- Initial/push GET requests use Foundation defaults: protocol cache policy and
+  60-second timeout. Cookies/storage are preserved. The no-commit UI guard is
+  75 seconds, not 45. Increasing this budget alone does not prove the bug fixed.
+- `EASYLAUNCH DIAG r6` includes the selected field and the installed bundle's
+  web ATS flag/domain override count. Launch marker: `2026-09-18-r6-flutter-parity`.
+- Portable tests cover ATS merging, preservation, idempotency and invalid input.
+  Export verification rejects a missing/disabled web policy before stamping the
+  binary identity; the manifest records `web_ats_exception=true`. Portable tests
+  also run in the Mac routing-test gate before XCTest.
+  Native tests cover url/click_url conflicts, fallback compatibility, default
+  request settings and cancellation without reloading an old page. The simulator
+  host uses the same web ATS key. Its local HTTP fixture does NOT verify HTTPS
+  downgrade or the production 777 URL: both still require iPhone acceptance.
+- NotificationService, its embedding script and Firebase dependencies are unchanged.
+
+## Running tests and earlier revision notes
+
 Run on a Mac with Xcode, an installed iOS Simulator, Python 3 and the `xcodeproj` Ruby gem:
 
 ```sh

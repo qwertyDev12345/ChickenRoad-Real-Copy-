@@ -39,6 +39,7 @@
 @property (nonatomic, strong, nullable) NSURL *diagnosticLastPushURL;
 @property (nonatomic, copy) NSString *deferredDiagnosticContext;
 @property (nonatomic, copy) NSString *diagnosticPushEntry;
+@property (nonatomic, copy) NSString *diagnosticPushField;
 @property (nonatomic, assign) BOOL startingUnity;
 @property (nonatomic, assign) NSUInteger openRequestGeneration;
 @property (nonatomic, assign) NSUInteger openRetryCount;
@@ -52,6 +53,7 @@
 - (void)pl_scheduleOpenAttemptAfter:(NSTimeInterval)delay;
 - (void)pl_drainPendingOpen;
 - (void)pl_presentationMayBeReady:(nullable NSNotification *)notification;
++ (nullable NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)userInfo selectedField:(NSString * _Nullable * _Nullable)selectedField;
 
 @end
 
@@ -77,15 +79,23 @@
 // MARK: - Push URL helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Only read navigation fields from THIS response. An explicit click target
-/// takes precedence over a generic URL, including across supported containers.
+/// Match the tested Flutter payload contract: url is the destination.
+/// Keep click_url only as a fallback for older senders with no valid url.
 + (nullable NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)userInfo
 {
+    return [self pl_pushURLFromUserInfo:userInfo selectedField:NULL];
+}
+
++ (nullable NSURL *)pl_pushURLFromUserInfo:(NSDictionary *)userInfo selectedField:(NSString * _Nullable * _Nullable)selectedField
+{
+    if (selectedField) *selectedField = nil;
     if (![userInfo isKindOfClass:NSDictionary.class]) return nil;
     NSArray *containers = @[userInfo, userInfo[@"data"] ?: NSNull.null,
                             userInfo[@"aps"] ?: NSNull.null];
-    for (NSString *key in @[@"click_url", @"url"]) {
-        for (id container in containers) {
+    NSArray *names = @[@"root", @"data", @"aps"];
+    for (NSString *key in @[@"url", @"click_url"]) {
+        for (NSUInteger index = 0; index < containers.count; index++) {
+            id container = containers[index];
             if (![container isKindOfClass:NSDictionary.class]) continue;
             id value = [(NSDictionary *)container objectForKey:key];
             if (![value isKindOfClass:NSString.class]) continue;
@@ -93,8 +103,10 @@
             if (!text.length) continue;
             NSURL *url = [NSURL URLWithString:text];
             NSString *scheme = url.scheme.lowercaseString;
-            if (url.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]))
+            if (url.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"])) {
+                if (selectedField) *selectedField = [NSString stringWithFormat:@"%@.%@", names[index], key];
                 return url;
+            }
             // A malformed candidate must not hide another valid field.
         }
     }
@@ -111,7 +123,9 @@
     // Извлекаем URL из cold-start push
     NSDictionary *remoteNotif = launchOptions[UIApplicationLaunchOptionsRemoteNotificationKey];
     if (remoteNotif) {
-        self.pendingPushURL = [CustomAppController pl_pushURLFromUserInfo:remoteNotif];
+        NSString *field = nil;
+        self.pendingPushURL = [CustomAppController pl_pushURLFromUserInfo:remoteNotif selectedField:&field];
+        self.diagnosticPushField = field;
         self.coldStartPushURL = self.pendingPushURL;
         self.diagnosticLastPushURL = self.pendingPushURL;
         self.diagnosticPushEntry = @"launchOptions";
@@ -139,7 +153,7 @@
 
     // The push fast path skips preload's SDK chain, but APNs callbacks still arrive.
     [PLServicesWrapper configureFirebase:nil];
-    NSLog(@"[EasyLaunch] routing revision 2026-09-17-r5-diag; build %@",
+    NSLog(@"[EasyLaunch] routing revision 2026-09-18-r6-flutter-parity; build %@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
     NSLog(@"[EasyLaunch] source commit=%@ patch_sha256=%@",
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"EasyLaunchSourceCommit"] ?: @"unknown",
@@ -161,7 +175,8 @@
              withCompletionHandler:(void (^)(void))completionHandler
 {
     NSDictionary *userInfo = response.notification.request.content.userInfo;
-    NSURL *pushURL = [CustomAppController pl_pushURLFromUserInfo:userInfo];
+    NSString *field = nil;
+    NSURL *pushURL = [CustomAppController pl_pushURLFromUserInfo:userInfo selectedField:&field];
 
     if (pushURL && ![response.actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -177,6 +192,7 @@
             NSLog(@"[CustomAppController] Push tap URL: %@", pushURL);
             NSUInteger generation = ++self.pushTapGeneration;
             self.diagnosticLastPushURL = pushURL;
+            self.diagnosticPushField = field;
             self.diagnosticPushEntry = self.preloadWindow == nil && self.engineLoadState < kUnityEngineLoadStateCoreInitialized ?
                 @"response before preload window" : @"notification response with existing window/engine";
             PreloadViewController *preloadVC =
@@ -273,8 +289,9 @@
     // Only the most recently tapped notification is allowed to navigate.
     if (generation != self.pushTapGeneration) return;
     self.deferredOpenURL = url;
-    self.deferredDiagnosticContext = [NSString stringWithFormat:@"tap=%lu; equals last push=%@; entry=%@; engine=%ld; preload=%@; Unity starting=%@",
+    self.deferredDiagnosticContext = [NSString stringWithFormat:@"tap=%lu; equals last push=%@; field=%@; entry=%@; engine=%ld; preload=%@; Unity starting=%@",
         (unsigned long)generation, [url isEqual:self.diagnosticLastPushURL] ? @"yes" : @"no/unknown",
+        self.diagnosticPushField ?: @"none",
         self.diagnosticPushEntry ?: @"no push observed", (long)self.engineLoadState,
         self.preloadInProgress ? @"yes" : @"no", self.startingUnity ? @"yes" : @"no"];
     self.openRequestGeneration++;

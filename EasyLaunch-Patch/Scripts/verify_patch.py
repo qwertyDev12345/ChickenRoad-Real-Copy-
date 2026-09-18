@@ -27,6 +27,10 @@ def verify(source_root: Path, xcode_root: Path, commit: str = "local") -> dict:
     plist_path = xcode_root / "Info.plist"
     with plist_path.open("rb") as stream:
         info = plistlib.load(stream)
+    ats = info.get("NSAppTransportSecurity", {})
+    if not isinstance(ats, dict) or ats.get("NSAllowsArbitraryLoadsInWebContent") is not True:
+        raise ValueError("Export is missing WebView ATS policy; run patch_infoplist.py before building")
+    manifest["web_ats_exception"] = True
     info["EasyLaunchSourceCommit"] = commit
     info["EasyLaunchPatchSHA256"] = fingerprint
     with plist_path.open("wb") as stream:
