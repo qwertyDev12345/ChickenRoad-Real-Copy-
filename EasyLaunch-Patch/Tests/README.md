@@ -1,5 +1,16 @@
 # Push and redirect regression checks
 
+## CI scheduling tolerance (September 18)
+
+The r7 simulator run compiled successfully and passed 39/40 native tests,
+including both new navigation-display cases. The POST safety test failed on
+the test helper's two-second `main queue drained` expectation, not a POST
+replay assertion; the log has multi-second gaps around WebKit/UIKit cleanup.
+The helper now allows up to 30 seconds (returning as soon as the queued block
+runs), matching the existing WebView wait budget. No app timeout or recovery
+policy changes. POST checks additionally assert unchanged load count, method
+and body. A new macOS run is required to validate this test-harness adjustment.
+
 ## r7: Flutter-style navigation display (September 18)
 
 - In the supplied Flutter archive, `isLoading` changes in page callbacks but is

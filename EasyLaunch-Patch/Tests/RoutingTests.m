@@ -122,7 +122,10 @@ extern NSData *PLTestAPNsToken;
 - (void)drainMainQueue {
     XCTestExpectation *done = [self expectationWithDescription:@"main queue drained"];
     dispatch_async(dispatch_get_main_queue(), ^{ [done fulfill]; });
-    [self waitForExpectations:@[done] timeout:2];
+    // This is a scheduling barrier, not an app responsiveness requirement.
+    // Xcode 26 CI can spend several seconds in UIKit/WebKit process cleanup.
+    // Match the real-WebView wait budget; completion still returns immediately.
+    [self waitForExpectations:@[done] timeout:30];
 }
 - (NSURL *)URL:(NSString *)path {
     return [NSURL URLWithString:[@"http://127.0.0.1:18765" stringByAppendingString:path]];
@@ -717,6 +720,7 @@ extern NSData *PLTestAPNsToken;
     [vc setValue:post forKey:@"mainFrameRequest"];
     [vc setValue:post forKey:@"retryRequest"];
     WKNavigation *navigation = [vc valueForKey:@"activeNavigation"];
+    NSUInteger loads = [[vc valueForKey:@"diagnosticLoadCount"] unsignedIntegerValue];
     [vc webViewWebContentProcessDidTerminate:[vc valueForKey:@"webView"]];
     [vc pl_retryLoading];
     [self drainMainQueue];
@@ -724,6 +728,9 @@ extern NSData *PLTestAPNsToken;
     XCTAssertTrue([[vc valueForKey:@"retryButton"] isHidden]);
     XCTAssertEqual(navigation, [vc valueForKey:@"activeNavigation"]);
     XCTAssertEqual([[vc valueForKey:@"processRecoveryCount"] unsignedIntegerValue], 0u);
+    XCTAssertEqual([[vc valueForKey:@"diagnosticLoadCount"] unsignedIntegerValue], loads);
+    XCTAssertEqualObjects([[vc valueForKey:@"mainFrameRequest"] HTTPMethod], @"POST");
+    XCTAssertEqualObjects([[vc valueForKey:@"mainFrameRequest"] HTTPBody], post.HTTPBody);
 }
 - (void)testRepeatedProcessFailureCancelsAlreadyQueuedRecovery {
     WebViewController *vc = [self showWebView:@"/a"];
