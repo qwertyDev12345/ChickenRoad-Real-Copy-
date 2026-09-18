@@ -33,6 +33,8 @@ extern NSData *PLTestAPNsToken;
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView;
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error;
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation;
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation;
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation;
 - (void)pl_retryLoading;
 - (void)pl_loadingDeadlineExpired:(NSUInteger)generation;
 - (NSString *)pl_diagnosticReportForError:(NSError *)error source:(NSString *)source;
@@ -553,9 +555,60 @@ extern NSData *PLTestAPNsToken;
     XCTAssertEqual(navigation, [vc valueForKey:@"activeNavigation"]);
     XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
     NSString *report = [vc pl_diagnosticReportForError:cancel source:@"test"];
-    XCTAssertTrue([report containsString:@"EASYLAUNCH DIAG r6"]);
+    XCTAssertTrue([report containsString:@"EASYLAUNCH DIAG r7"]);
     XCTAssertTrue([report containsString:@"UI deadline=75s"]);
     XCTAssertTrue([report containsString:@"Web ATS exception=yes"]);
+    [self waitForWebView:vc path:@"/777"];
+}
+- (void)testNavigationKeepsWebViewVisibleLikeFlutter {
+    WebViewController *vc = [self showWebView:@"/hello"];
+    WKWebView *web = [vc valueForKey:@"webView"];
+    UIView *status = [vc valueForKey:@"loadStatusView"];
+    XCTAssertTrue(status.hidden); // No loading overlay, including first load.
+    [self waitForWebView:vc path:@"/hello"];
+    WKNavigation *previous = [vc valueForKey:@"activeNavigation"];
+    [vc navigateToURL:[self URL:@"/777"]];
+    WKNavigation *current = [vc valueForKey:@"activeNavigation"];
+    XCTAssertTrue(status.hidden);
+    [vc webView:web didStartProvisionalNavigation:current];
+    XCTAssertTrue(status.hidden);
+    NSUInteger deadline = [[vc valueForKey:@"loadStatusGeneration"] unsignedIntegerValue];
+    [vc webView:web didCommitNavigation:current];
+    XCTAssertTrue(status.hidden); // Commit must not reveal a previously covered frame.
+    [vc pl_loadingDeadlineExpired:deadline];
+    XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    NSError *cancel = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+    [vc webView:web didFailProvisionalNavigation:previous withError:cancel];
+    [vc webView:web didFinishNavigation:previous];
+    XCTAssertEqual(current, [vc valueForKey:@"activeNavigation"]);
+    XCTAssertTrue(status.hidden);
+    XCTAssertEqual(web, [vc valueForKey:@"webView"]);
+    XCTAssertFalse(web.hidden);
+    [self waitForWebView:vc path:@"/777"];
+
+    // Exercise the separate didStart path used by links/JavaScript in a page.
+    // Do not trigger a second loadRequest from the navigation delegate.
+    WKNavigation *link = [web loadRequest:[NSURLRequest requestWithURL:[self URL:@"/final"]]];
+    [vc webView:web didStartProvisionalNavigation:link];
+    XCTAssertTrue(status.hidden);
+    XCTAssertEqual(link, [vc valueForKey:@"activeNavigation"]);
+    [self waitForWebView:vc path:@"/final"];
+    XCTAssertTrue(status.hidden);
+    XCTAssertEqual(web, [vc valueForKey:@"webView"]);
+}
+- (void)testNewPushClearsErrorWithoutShowingLoadingOverlay {
+    WebViewController *vc = [self showWebView:@"/hello"];
+    [self waitForWebView:vc path:@"/hello"];
+    WKWebView *web = [vc valueForKey:@"webView"];
+    WKNavigation *failed = [vc valueForKey:@"activeNavigation"];
+    NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil];
+    [vc webView:web didFailNavigation:failed withError:error];
+    XCTAssertFalse([[vc valueForKey:@"loadStatusView"] isHidden]);
+    [vc navigateToURL:[self URL:@"/777"]];
+    XCTAssertTrue([[vc valueForKey:@"loadStatusView"] isHidden]);
+    XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
+    [vc webView:web didFailNavigation:failed withError:error];
+    XCTAssertTrue([[vc valueForKey:@"loadStatusView"] isHidden]);
     [self waitForWebView:vc path:@"/777"];
 }
 - (void)testTooManyRedirectsDoesNotReplayPOST {
@@ -630,7 +683,7 @@ extern NSData *PLTestAPNsToken;
     [vc pl_retryLoading]; // stale UI action cannot replay 777
     XCTAssertEqual([vc valueForKey:@"activeNavigation"], latest);
     XCTAssertFalse([[vc valueForKey:@"displayingLoadError"] boolValue]);
-    XCTAssertFalse([[vc valueForKey:@"loadStatusView"] isHidden]);
+    XCTAssertTrue([[vc valueForKey:@"loadStatusView"] isHidden]);
     [self waitForWebView:vc path:@"/new-push"];
 }
 - (void)testLoadingDeadlineCannotStopNewerPushOrCompletedPage {

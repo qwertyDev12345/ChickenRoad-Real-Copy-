@@ -68,7 +68,6 @@ static NSString *PLDiagnosticURL(NSURL *url)
 @property (nonatomic, assign) NSUInteger processRecoveryCount;
 @property (nonatomic, copy) NSURLRequest *retryRequest;
 @property (nonatomic, strong) UIView *loadStatusView;
-@property (nonatomic, strong) UIActivityIndicatorView *loadSpinner;
 @property (nonatomic, strong) UILabel *loadStatusLabel;
 @property (nonatomic, strong) UIButton *retryButton;
 @property (nonatomic, assign) BOOL displayingLoadError;
@@ -115,7 +114,8 @@ static NSString *PLDiagnosticURL(NSURL *url)
         [self pl_beginDiagnosticRoute:url];
         if (!self.isViewLoaded || !self.webView) return;
 
-        [self.webView stopLoading];
+        // Match Flutter's direct loadRequest on the existing WebView. The new
+        // navigation replaces the old one; cancellation callbacks stay ignored.
 
         NSURLRequest *request = [NSURLRequest requestWithURL:url
                                                 cachePolicy:NSURLRequestUseProtocolCachePolicy
@@ -280,7 +280,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
         [webException respondsToSelector:@selector(boolValue)] && [webException boolValue] ? @"yes" : @"no",
         (unsigned long)([domainExceptions isKindOfClass:NSDictionary.class] ? [domainExceptions count] : 0)];
     return [NSString stringWithFormat:
-        @"EASYLAUNCH DIAG r6\nSource: %@\nError: %@\nStage: %@\nElapsed: %.2fs; loads=%lu; redirects=%lu\n"
+        @"EASYLAUNCH DIAG r7\nSource: %@\nError: %@\nStage: %@\nElapsed: %.2fs; loads=%lu; redirects=%lu\n"
         @"Started=%@; committed=%@\nLast response: %@\n\nRoute URL (initial/push): %@\nCurrent request: %@\nLast redirect: %@\nWebView URL: %@\nFailing URL: %@\n\n"
         @"Routing: %@\nMethod: %@; request timeout=%.0fs; UI deadline=%.0fs\nApp state=%ld (0=active,1=inactive,2=background); scene=%ld\nAttached=%@; visible=%@; loading=%@; progress=%.2f\n"
         @"Notifications: %@\nLast skip: %@\nSaved launch mode: %@\nData store: %@; custom UA: %@\n%@\n"
@@ -320,8 +320,6 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.loadStatusView.accessibilityIdentifier = @"web-load-status";
     self.loadStatusView.hidden = YES;
     [self.view addSubview:self.loadStatusView];
-    self.loadSpinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-    self.loadSpinner.color = UIColor.whiteColor;
     self.loadStatusLabel = [UILabel new];
     self.loadStatusLabel.textColor = UIColor.whiteColor;
     self.loadStatusLabel.textAlignment = NSTextAlignmentCenter;
@@ -344,7 +342,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     [self.diagnosticCopyButton addTarget:self action:@selector(pl_copyDiagnostics) forControlEvents:UIControlEventTouchUpInside];
     self.diagnosticCopyButton.accessibilityIdentifier = @"web-copy-diagnostics";
     self.diagnosticCopyButton.hidden = YES;
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.loadSpinner, self.loadStatusLabel, self.diagnosticTextView, self.diagnosticCopyButton, self.retryButton]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.loadStatusLabel, self.diagnosticTextView, self.diagnosticCopyButton, self.retryButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -393,13 +391,14 @@ static NSString *PLDiagnosticURL(NSURL *url)
         ([method isEqualToString:@"GET"] || [method isEqualToString:@"HEAD"]);
 }
 
-- (void)pl_showLoading
+- (void)pl_beginLoading
 {
     self.displayingLoadError = NO;
-    self.loadStatusView.hidden = NO;
-    self.loadSpinner.hidden = NO;
-    [self.loadSpinner startAnimating];
-    self.loadStatusLabel.text = @"Loading…";
+    // Flutter keeps its PlatformWebViewWidget visible throughout navigation;
+    // its isLoading flag does not render a loading overlay. Preserve WebKit's
+    // page transition instead of covering it and revealing the old frame at
+    // didCommit (which is not a first-paint callback). This view is errors-only.
+    self.loadStatusView.hidden = YES;
     self.retryButton.hidden = YES;
     self.diagnosticTextView.hidden = YES;
     self.diagnosticCopyButton.hidden = YES;
@@ -426,7 +425,6 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.loadStatusGeneration++;
     self.displayingLoadError = NO;
     self.loadStatusView.hidden = YES;
-    [self.loadSpinner stopAnimating];
 }
 
 - (void)pl_showLoadError:(NSError *)error source:(NSString *)source
@@ -442,8 +440,6 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.loadStatusGeneration++;
     self.displayingLoadError = YES;
     self.loadStatusView.hidden = NO;
-    [self.loadSpinner stopAnimating];
-    self.loadSpinner.hidden = YES;
     BOOL safeRetry = [self pl_isSafeRequest:self.retryRequest] && [self pl_isSafeRequest:self.mainFrameRequest];
     self.retryButton.hidden = !safeRetry;
     self.loadStatusLabel.text = [NSString stringWithFormat:@"Unable to load this page.\n(%@ %ld)\nCopy diagnostics and send the report.%@",
@@ -480,7 +476,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.url = request.URL;
     self.lastServerRedirectURL = nil;
     self.mainFrameRequest = request;
-    [self pl_showLoading];
+    [self pl_beginLoading];
     self.activeNavigation = [self.webView loadRequest:request];
 }
 
@@ -502,7 +498,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.diagnosticDidStart = YES;
     self.diagnosticStage = @"provisional started; waiting for response/commit";
     [self pl_recordDiagnostic:@"didStartProvisional" URL:webView.URL];
-    [self pl_showLoading];
+    [self pl_beginLoading];
 }
 
 - (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation
@@ -685,7 +681,7 @@ static NSString *PLDiagnosticURL(NSURL *url)
     self.processRecoveryCount++;
     NSUInteger generation = self.navigationGeneration;
     NSURLRequest *recoveryRequest = self.mainFrameRequest;
-    [self pl_showLoading];
+    [self pl_beginLoading];
     // Brief delay to let the process fully clean up before reloading
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (generation != self.navigationGeneration) return;

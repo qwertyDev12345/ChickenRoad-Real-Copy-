@@ -1,5 +1,28 @@
 # Push and redirect regression checks
 
+## r7: Flutter-style navigation display (September 18)
+
+- In the supplied Flutter archive, `isLoading` changes in page callbacks but is
+  not rendered by `build`: the same `PlatformWebViewWidget` stays visible. Match
+  that behavior instead of covering every navigation with a black loading view
+  and uncovering it at `didCommit`, before a new frame is necessarily painted.
+- New pushes call `loadRequest` on the existing WKWebView without a separate
+  `stopLoading`. Old cancellation callbacks still cannot reload the old route.
+- The overlay is errors-only. The 75-second no-commit guard, error diagnostics,
+  safe manual retry and stale-navigation/recovery guards remain in place.
+  On a first load the WebView may be blank until content arrives, as in Flutter;
+  removing the overlay does not accelerate loading or eliminate iOS snapshots.
+- Native regression cases cover initial/push/page navigation visibility,
+  start/commit callbacks, stale completion/cancellation, clearing an old error,
+  preserving the WebView instance and invalidating the watchdog after commit.
+  Run them on macOS; Windows portable checks cannot validate UIKit rendering.
+- iPhone acceptance: Hello -> tests; Hello -> 777 while loading and after load;
+  cold launch from either push; Skip -> Allow -> both pushes; offline failure
+  and retry. Check for flicker and correct final destination in each case.
+- Diagnostic revision: `EASYLAUNCH DIAG r7`; launch marker:
+  `2026-09-18-r7-flutter-navigation-ui`. URL selection, ATS, cookies, notification
+  images and Firebase dependencies are unchanged from r6.
+
 ## r6: Flutter reference compatibility (September 18)
 
 - Valid `url` fields (root, data, aps) now precede legacy `click_url` fields,
